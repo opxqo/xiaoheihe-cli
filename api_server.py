@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     crawler = XiaoHeiHeCrawler(headless=False, silent=True)
     await crawler.init_browser()
     
-    print("[OK] 浏览器已启动并保持连接（显示窗口模式，提高响应速度）")
+    print("[OK] 浏览器已启动并保持连接（显示窗口模式）")
     print("[OK] API服务器准备就绪")
     print("="*80)
     
@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="小黑盒爬虫API",
-    description="高性能小黑盒帖子和评论爬取服务 | 浏览器持久化连接",
+    description="小黑盒帖子和评论爬取服务",
     version="2.0.0",
     docs_url=None,
     redoc_url=None,
