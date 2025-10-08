@@ -198,6 +198,84 @@ xiaoheihe_pybu/
 4. 视频元数据（宽高、时长）在视频未加载时可能为空
 5. 建议合理控制请求频率
 
+## 免责声明
+
+### 法律声明
+
+本项目（xiaoheihe-crawler-api）仅供学习、研究和技术交流使用。使用本项目时，您必须遵守以下条款：
+
+#### 1. 使用限制
+
+- ✅ **允许**：个人学习、技术研究、非商业用途
+- ❌ **禁止**：商业用途、大规模数据采集、侵犯他人权益
+- ❌ **禁止**：用于任何违反法律法规的行为
+
+#### 2. 数据使用规范
+
+- 爬取的数据仅供个人学习使用
+- 不得传播、出售或用于商业目的
+- 必须尊重原网站的版权和用户隐私
+- 不得对目标网站造成负担或损害
+
+#### 3. 用户责任
+
+使用本项目时，用户应当：
+- 遵守中华人民共和国相关法律法规
+- 遵守《网络安全法》、《数据安全法》、《个人信息保护法》
+- 遵守小黑盒平台的服务条款和robots.txt协议
+- 合理控制请求频率，避免对服务器造成压力
+
+#### 4. 免责条款
+
+- 本项目作者不对使用本工具产生的任何后果负责
+- 因使用本工具导致的任何法律纠纷与作者无关
+- 用户使用本工具的一切行为由用户本人承担全部责任
+- 本工具按"原样"提供，不提供任何明示或暗示的保证
+
+#### 5. 知识产权
+
+- 小黑盒及其数据的所有权归其所有者
+- 本项目代码采用MIT License开源协议
+- 使用本项目不代表获得小黑盒数据的任何权利
+
+#### 6. 合规建议
+
+建议用户：
+- 仅在测试环境使用
+- 设置合理的请求间隔（建议≥3秒）
+- 不要在生产环境大规模部署
+- 定期检查并遵守目标网站的最新条款
+
+### 风险提示
+
+⚠️ **重要提示**：
+- 网络爬虫可能违反网站服务条款
+- 过度爬取可能导致IP被封禁
+- 数据采集需遵守相关法律法规
+- 商业用途需获得平台授权
+
+**使用本项目即表示您已阅读、理解并同意遵守以上所有条款。如不同意，请立即停止使用。**
+
 ## License
 
 MIT License
+
+Copyright (c) 2025 Li Fangyu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
