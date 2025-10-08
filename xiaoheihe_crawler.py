@@ -1,7 +1,3 @@
-"""
-小黑盒爬虫 - 使用Playwright处理客户端渲染
-这是专业爬虫的标准做法，用于处理动态JavaScript网站
-"""
 import json
 import asyncio
 import re
@@ -12,7 +8,7 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 from models import Post, PostAuthor, PostStats, PostImage, PostVideo, Comment, CommentUser, CommentImage, Medal, Emoji
 
 class XiaoHeiHeCrawler:
-    """小黑盒爬虫 - 支持浏览器持久化连接（提高API响应速度）"""
+   
     
     def __init__(self, output_dir: str = "data", headless: bool = False, silent: bool = False):
         """
@@ -63,7 +59,7 @@ class XiaoHeiHeCrawler:
     
     async def get_post_data(self, url: str) -> Optional[dict]:
         """
-        从页面获取帖子数据（支持浏览器持久化）
+        从页面获取帖子数据
         
         Args:
             url: 帖子URL
@@ -1059,13 +1055,6 @@ async def main():
     """主函数"""
     print("="*80)
     print("小黑盒爬虫 - 专业爬虫方案")
-    print("="*80)
-    print("\n技术特点：")
-    print("- 使用Playwright处理客户端渲染（CSR）")
-    print("- 无头模式运行，禁用图片/CSS加载")
-    print("- 这是现代爬虫的标准做法")
-    print("="*80)
-    
     print("\n请选择功能:")
     print("1. 爬取单个帖子")
     print("2. 批量爬取帖子")
