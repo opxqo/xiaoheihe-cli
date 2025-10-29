@@ -138,13 +138,13 @@ class XiaoHeiHeCrawler:
                     return null;
                 }
                 
-                // 从DOM中提取真实的帖子图片URL
+                
                 // 策略：取连续的图片（domIndex间隔不超过2），过滤相似内容
                 const allImgs = Array.from(document.querySelectorAll('img'));
                 const realImages = [];
                 const candidateImages = [];
                 
-                // 1. 收集候选图片
+                
                 document.querySelectorAll('img[src*="imgheybox"]').forEach(img => {
                     if (img.src && 
                         !img.src.includes('avatar') && 
@@ -155,7 +155,7 @@ class XiaoHeiHeCrawler:
                         img.src.includes('/bbs/') &&
                         img.naturalWidth > 400) {
                         
-                        // 检查是否在"相似内容"区域
+                       
                         let element = img;
                         let isInRelated = false;
                         let depth = 0;
@@ -182,7 +182,7 @@ class XiaoHeiHeCrawler:
                 // 2. 按domIndex排序
                 candidateImages.sort((a, b) => a.domIndex - b.domIndex);
                 
-                // 3. 只取连续的图片（domIndex间隔不超过2）
+                
                 if (candidateImages.length > 0) {
                     realImages.push(candidateImages[0].src);
                     
@@ -197,13 +197,13 @@ class XiaoHeiHeCrawler:
                     }
                 }
                 
-                // 将真实的图片URL添加到结果中
+                
                 result.realImages = realImages;
                 
                 // 不再从DOM提取子评论，直接使用__NUXT__中的comment数组
                 // 每个评论对象的comment字段包含完整的子评论数据（用户头像、图片等）
                 
-                // 提取表情映射（使用固定的雪碧图URL）
+                /
                 const emojiMap = {};
                 const CUBE_EMOJI_SPRITE_URL = 'https://static.max-c.com/heybox_web/emoji/cube/cube_emoji_v19.png';
                 
@@ -217,12 +217,12 @@ class XiaoHeiHeCrawler:
                     const emojiId = match ? match[1] : '';
                     
                     if (emojiName && !emojiMap[emojiName]) {
-                        // 直接使用backgroundPositionX和backgroundPositionY组合
+                        // 使用backgroundPositionX和backgroundPositionY组合
                         const bgX = style.backgroundPositionX;
                         const bgY = style.backgroundPositionY;
                         let bgPosition = style.backgroundPosition;
                         
-                        // 优先使用X/Y值（更可靠）
+                        // 使用X/Y值
                         if (bgX && bgY) {
                             bgPosition = `${bgX} ${bgY}`;
                         }
