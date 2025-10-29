@@ -123,11 +123,11 @@ async def custom_docs():
             use-path-in-nav-bar="true"
         >
             <div slot="overview">
-                <h2>🚀 高性能爬虫API</h2>
-                <p>✅ 浏览器持久化连接 - 提高响应速度</p>
-                <p>✅ 帖子和评论分离 - 灵活获取数据</p>
-                <p>✅ 评论分页支持 - 处理大量数据</p>
-                <p>✅ 纯JSON输出 - 标准RESTful API</p>
+                <h2>爬虫API</h2>
+                <p> 浏览器持久化</p>
+                <p> 帖子和评论分离</p>
+                <p> 评论分页支持 - 处理大量数据</p>
+                <p> 纯JSON输出 - 标准RESTful API</p>
             </div>
         </rapi-doc>
     </body>
