@@ -1,16 +1,17 @@
 # 小黑盒爬虫 API
 
-专业的小黑盒社区帖子爬虫，支持提取帖子、评论、图片、视频、表情、勋章等完整数据。
+专业的小黑盒社区帖子爬虫，支持 **CLI 命令行调用**、**守护模式（浏览器常驻）**、**Python SDK** 和 **RESTful API** 四种使用方式。
 
-##  特性
+## ✨ 特性
 
--  完整数据提取：帖子、作者、评论、图片、视频、表情、勋章
--  视频支持：提取视频URL、封面图、尺寸、时长
--  表情资源：精准提取表情雪碧图位置，支持前端渲染
--  勋章系统：用户勋章列表和佩戴状态
--  嵌套评论：完整的子评论数据，包含用户头像和图片
--  RESTful API：FastAPI 提供高性能接口
--  浏览器持久化：复用浏览器实例，响应速度快
+- 🚀 **CLI 一行调用**: `xiaoheihe get 179245676` 即刻获取帖子
+- ⚡ **守护模式**: 浏览器常驻，后续请求秒回，无需重复启动
+- 📦 **Python SDK**: `async with XiaoheiheClient() as c:` 直接 import 使用
+- 🔌 **RESTful API**: FastAPI 提供标准 HTTP 接口
+- 📊 **多格式输出**: JSON / 简洁表格 / CSV
+- 完整数据提取：帖子、评论、嵌套评论、图片、视频、表情、勋章
+- Cookie 持久化：首次登录后自动复用
+- Docker 部署支持
 
 ## 快速开始
 
@@ -21,16 +22,131 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. 启动API服务器
+### 2. CLI 用法（推荐）
+
+```bash
+# 获取帖子（简洁表格显示）
+python cli.py get 179245676
+
+# 获取完整帖子（含所有评论）
+python cli.py get 179245676 --full
+
+# 只看评论
+python cli.py comments 179245676
+
+# 批量爬取
+python cli.py batch ids.txt
+
+# 输出格式选择
+python cli.py get 179245676 -f json        # 完整JSON
+python cli.py get 179245676 -f table       # 简洁表格（默认）
+python cli.py batch ids.txt -f csv         # 导出CSV
+python cli.py get 179245676 -o post.json   # 保存到文件
+```
+
+### 3. 守护模式（浏览器常驻）
+
+```bash
+# 终端1：启动守护进程（浏览器只启动一次）
+python cli.py serve
+
+# 终端2：随时调用（秒响应）
+python cli.py get 179245676              # 自动连接守护进程
+python cli.py get 977e70c3b33f --full    # 秒回
+python cli.py batch ids.txt              # 批量也走守护进程
+
+# 查看状态
+python cli.py status
+```
+
+### 4. Python SDK 调用
+
+```python
+import asyncio
+from xiaoheihe import XiaoheiheClient
+
+async def main():
+    # 直连模式（自动管理浏览器生命周期）
+    async with XiaoheiheClient(headless=True) as client:
+        post = await client.get_post("179245676")
+        print(f"标题: {post['title']}")
+        print(f"作者: {post['author']['name']}")
+
+        # 获取评论
+        comments = await client.get_comments("179245676", page=1, page_size=10)
+        for c in comments["comments"]:
+            print(f"{c['author']['name']}: {c['content']}")
+
+        # 批量
+        results = await client.batch_get(["179245676", "179290771"])
+
+    # 守护模式调用
+    client = XiaoheiheClient(daemon=True)
+    post = await client.get_post("179245676")
+    await client.close()
+
+asyncio.run(main())
+```
+
+### 5. RESTful API 服务
 
 ```bash
 python api_server.py
 ```
 
-服务器启动后：
+服务地址：
 - API文档: http://localhost:8010/docs
-- 备用文档: http://localhost:8010/redoc
 - 健康检查: http://localhost:8010/health
+
+## Docker 部署
+
+### 首次登录（必须先做）
+
+首次使用需要人工登录通过验证码，此步骤必须在 Docker 之外完成：
+
+```bash
+# 本地安装并启动
+pip install -r requirements.txt
+playwright install chromium
+python api_server.py
+# 浏览器窗口会自动打开，完成验证码登录
+# cookies.json 会自动保存，然后 Ctrl+C 停止
+```
+
+### Docker 启动
+
+```bash
+# 确认 cookies.json 已存在
+docker compose up -d --build
+
+# 查看状态
+curl http://localhost:8010/health
+
+# 查看日志
+docker compose logs -f
+```
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `HEADLESS` | `true` | 浏览器无头模式，Docker 环境必须为 `true` |
+| `PORT` | `8010` | 服务器监听端口 |
+
+### 数据持久化
+
+- `cookies.json` — 登录凭证，绑定挂载到宿主机，重启后复用
+- `data/` — 图片下载目录（当前默认不下载图片）
+
+### 刷新 Cookie
+
+```bash
+# 方式1：本地重新登录，替换 cookies.json
+# 方式2：停止容器后本地登录
+docker compose down
+python api_server.py  # 本地完成验证码
+docker compose up -d
+```
 
 ## API端点
 
@@ -96,9 +212,10 @@ Content-Type: application/json
     "duration": 101.216
   },
   "stats": {
-    "likes": 66,
-    "favorites": 12,
-    "comments": 31
+    "views": 484786,
+    "likes": 808,
+    "favorites": 114,
+    "comments": 1437
   },
   "comments": [...]
 }
@@ -181,13 +298,22 @@ for comment in data['data']['comments']:
 ## 项目结构
 
 ```
-xiaoheihe_pybu/
-├── xiaoheihe_crawler.py    # 爬虫核心
-├── api_server.py           # API服务器
-├── models.py               # 数据模型
+xiaoheihe/
+├── cli.py                  # CLI 入口（多子命令：get/comments/batch/serve/status）
+├── xiaoheihe/
+│   └── __init__.py         # SDK 核心（XiaoheiheClient + DaemonServer）
+├── api_server.py           # FastAPI HTTP 服务
+├── browser_manager.py      # 浏览器管理 + Cookie 持久化
+├── api_client.py           # API 请求层（Playwright 页面拦截）
+├── data_parser.py          # JSON → Pydantic 模型解析
+├── models.py               # 数据模型定义
+├── utils.py                # 公共工具函数
+├── crawler.py              # 旧版 CLI（保留兼容）
 ├── requirements.txt        # 依赖列表
+├── Dockerfile              # Docker 镜像
+├── docker-compose.yml      # Docker Compose 编排
 ├── README.md              # 本文件
-└── data/                  # 输出目录
+└── cookies.json            # 持久化 Cookie（自动生成，不提交）
 ```
 
 ## 注意事项

@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Git
+.git/
+.gitignore
+
+# Virtual environments
+.env
+.venv
+venv/
+
+# Local data (will be volume-mounted)
+data/images/*
+data/*.json
+data/*.txt
+
+# Cookies (will be volume-mounted)
+cookies.json
+
+# OS files
+.DS_Store
+Thumbs.db
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Playwright browser data (already in image)
+.ms-playwright/

@@ -1,0 +1,26 @@
+services:
+  crawler-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: xiaoheihe-crawler-api
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./cookies.json:/app/cookies.json:rw
+      - ./data:/app/data:rw
+    environment:
+      - HEADLESS=true
+      - PORT=8010
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

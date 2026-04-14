@@ -17,7 +17,33 @@ data/images/*
 .venv
 venv/
 
+# Cookie persistence
+cookies.json
+.xhh_cookie
+
+# Test / debug artifacts
+_test_*
+_inject_*
+_publish_*
+_route_*
+_request_*
+_explore_*
+_final_*
+_new_*
+_http_*
+
+# Daemon runtime
+.xiaoheihe-daemon.sock
+.xiaoheihe-daemon.pid
+
 .DS_Store
 Thumbs.db
 *.log
+
+# WorkBuddy workspace config
+.workbuddy/
+
+# Creator report artifacts
+_creator_report*
+
 
