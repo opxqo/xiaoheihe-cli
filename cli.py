@@ -467,9 +467,31 @@ async def cmd_list(args):
 
 async def cmd_publish(args):
     """发布文章命令"""
-    html_content = ""
-    if args.content:
-        html_content = args.content
+    html_content = None
+    convert_stats = None
+
+    if getattr(args, "markdown", None):
+        # Markdown 输入 → 自动转换为小黑盒兼容格式
+        from markdown_converter import HeyBoxConverter
+        converter = HeyBoxConverter()
+        html_content = converter.convert(args.markdown, source_format="markdown")
+        convert_stats = converter.stats.summary()
+        logger.info("Markdown 已转换为小黑盒兼容格式: %s", convert_stats)
+
+    elif args.content:
+        # 检测是否包含需要转换的内容（代码块/表格等）
+        raw = args.content
+        needs_convert = any(marker in raw for marker in ("```", "<pre", "<table", "`code`", "~~"))
+        if needs_convert:
+            from markdown_converter import HeyBoxConverter
+            converter = HeyBoxConverter()
+            html_content = converter.convert(raw)
+            convert_stats = converter.stats.summary()
+            if convert_stats != "无需转换":
+                logger.info("内容已优化为小黑盒兼容格式: %s", convert_stats)
+        else:
+            html_content = raw
+
     elif args.html:
         try:
             with open(args.html, "r", encoding="utf-8") as f:
@@ -477,7 +499,8 @@ async def cmd_publish(args):
         except FileNotFoundError:
             logger.error("HTML 文件不存在: %s", args.html)
             sys.exit(1)
-    else:
+
+    if not html_content:
         html_content = f"<p>{args.title}</p>"
 
     async with _ClientCtx(args) as c:
@@ -496,6 +519,8 @@ async def cmd_publish(args):
     print(color(f"  {'='*min(w, 50)}", CYAN))
     status_icon = GREEN + "[OK]" + RESET if result.get("success") else YELLOW + "[FAIL]" + RESET
     print(f"  {status_icon} {action}: {result.get('title', args.title)}")
+    if convert_stats and convert_stats != "无需转换":
+        print(color(f"  格式转换: {convert_stats}", DIM))
     print(color(f"  {'─'*min(w, 50)}", DIM))
 
     if result.get("success"):
@@ -720,6 +745,7 @@ def main():
     p_pub.add_argument("title", help="文章标题（用引号包裹）")
     p_pub.add_argument("--html", help="HTML 正文文件路径")
     p_pub.add_argument("-c", "--content", default=None, help="HTML 正文内容（直接传入）")
+    p_pub.add_argument("-m", "--markdown", default=None, help="Markdown 正文（自动转换为小黑盒兼容格式）")
     p_pub.add_argument("--tag", type=int, default=11, dest="link_tag",
                        help="标签ID（默认11=校园生活）")
     p_pub.add_argument("--publish", action="store_true", dest="do_publish",

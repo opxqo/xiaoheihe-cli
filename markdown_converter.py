@@ -1,0 +1,780 @@
+"""
+小黑盒 Markdown 兼容格式转换器
+
+将 Markdown/HTML 内容转换为小黑盒编辑器兼容的富文本格式。
+解决小黑盒不原生支持代码块、表格等问题。
+
+核心功能:
+- 代码块 → Pillow+Pygments 语法高亮图片 (Base64)
+- 表格 → Pillow 渲染图片 (Base64)
+- 行内代码 `` `code` `` → **加粗** 降级
+- 删除线 ~~text~~ → **加粗** 降级
+- 外部链接标准化（内部链接保留）
+- 本地/相对路径图片提示
+
+用法:
+    from markdown_converter import HeyBoxConverter
+
+    converter = HeyBoxConverter()
+    html = converter.convert(markdown_text)
+    # 或直接从 HTML 输入
+    html = converter.convert_html(raw_html)
+
+依赖:
+    - Pillow (PIL): 图片渲染
+    - pygments: 代码语法高亮
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import re
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+# 延迟导入，避免无 GUI 环境报错
+_PIL_AVAILABLE = False
+_PYGMENTS_AVAILABLE = False
+
+
+def _check_deps():
+    """检查并标记可用依赖。"""
+    global _PIL_AVAILABLE, _PYGMENTS_AVAILABLE
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # noqa: F401
+        _PIL_AVAILABLE = True
+    except ImportError:
+        pass
+    try:
+        import pygments  # noqa: F401
+        from pygments.lexers import get_lexer_by_name  # noqa: F401
+        from pygments.formatters import ImageFormatter  # noqa: F401
+        _PYGMENTS_AVAILABLE = True
+    except ImportError:
+        pass
+
+
+_check_deps()
+
+
+@dataclass
+class ConvertStats:
+    """转换统计信息。"""
+    code_blocks: int = 0          # 代码块转图片数量
+    tables: int = 0               # 表格转图片数量
+    inline_codes: int = 0         # 行内代码降级数量
+    strikethroughs: int = 0       # 删除线降级数量
+    links_fixed: int = 0          # 链接修复数量
+    images_fixed: int = 0         # 图片修复数量
+
+    def summary(self) -> str:
+        parts = []
+        if self.code_blocks:
+            parts.append(f"代码块→{self.code_blocks}张图")
+        if self.tables:
+            parts.append(f"表格→{self.tables}张图")
+        if self.inline_codes:
+            parts.append(f"行内代码→{self.inline_codes}处加粗")
+        if self.strikethroughs:
+            parts.append(f"删除线→{self.strikethroughs}处加粗")
+        if self.links_fixed:
+            parts.append(f"链接修复{self.links_fixed}")
+        if self.images_fixed:
+            parts.append(f"图片修复{self.images_fixed}")
+        return ", ".join(parts) if parts else "无需转换"
+
+
+class HeyBoxConverter:
+    """
+    小黑盒兼容格式转换器。
+
+    将 Markdown 或 HTML 内容转换为小黑盒编辑器可正确渲染的格式。
+    """
+
+    # ---- 配置常量 ----
+
+    # 表格最大宽度（像素）
+    TABLE_MAX_WIDTH = 560
+
+    # 单元格内边距
+    TABLE_CELL_PADDING = 10
+
+    # 基准行高
+    TABLE_LINE_HEIGHT = 36
+
+    # 颜色方案
+    COLOR_BG = "#ffffff"
+    COLOR_TABLE_HEADER = "#f5f5f5"
+    COLOR_TABLE_BORDER = "#e0e0e0"
+    COLOR_TEXT = "#333333"
+    COLOR_CODE_BG = "#f6f8fa"
+
+    def __init__(self):
+        self.stats = ConvertStats()
+
+    def convert(self, text: str, source_format: str = "auto") -> str:
+        """
+        转换文本为小黑盒兼容 HTML。
+
+        Args:
+            text: 输入内容（Markdown 或 HTML）
+            source_format: 'auto' | 'markdown' | 'html'
+
+        Returns:
+            兼容小黑盒的 HTML 字符串
+        """
+        self.stats = ConvertStats()
+
+        if not text or not text.strip():
+            return ""
+
+        # 自动检测格式
+        if source_format == "auto":
+            source_format = self._detect_format(text)
+
+        if source_format == "markdown":
+            return self._convert_markdown(text)
+        else:
+            return self._convert_html(text)
+
+    def convert_html(self, html: str) -> str:
+        """从 HTML 输入转换的快捷方法。"""
+        return self.convert(html, source_format="html")
+
+    def convert_markdown(self, md: str) -> str:
+        """从 Markdown 输入转换的快捷方法。"""
+        return self.convert(md, source_format="markdown")
+
+    # ==================== 格式检测 ====================
+
+    @staticmethod
+    def _detect_format(text: str) -> str:
+        """简单启发式检测输入是 Markdown 还是 HTML。"""
+        stripped = text.strip()
+        if stripped.startswith("<") and any(
+            tag in stripped[:50].lower()
+            for tag in ("<p>", "<div>", "<h", "<br", "<img", "<table", "<pre", "<code")
+        ):
+            return "html"
+        return "markdown"
+
+    # ==================== Markdown 转换主流程 ====================
+
+    def _convert_markdown(self, md: str) -> str:
+        """Markdown → 小黑盒兼容 HTML 的完整流水线。"""
+        result = md
+
+        # Phase 1: 代码块 → 图片
+        result = self._process_code_blocks(result)
+
+        # Phase 2: 表格 → 图片
+        result = self._process_tables(result)
+
+        # Phase 3: 本地图片处理
+        result = self._process_local_images(result)
+
+        # Phase 4: 格式标准化（行内代码、删除线、链接等）
+        result = self._normalize_markdown_format(result)
+
+        # Phase 5: 段落包装
+        result = self._wrap_paragraphs(result)
+
+        return result.strip()
+
+    # ==================== HTML 转换主流程 ====================
+
+    def _convert_html(self, html: str) -> str:
+        """HTML → 小黑盒兼容 HTML 的完整流水线。"""
+        result = html
+
+        # Phase 1: <pre><code> 代码块 → 图片
+        result = self._process_html_code_blocks(result)
+
+        # Phase 2: <table> 表格 → 图片
+        result = self._process_html_tables(result)
+
+        # Phase 3: <code> 行内代码 → 加粗
+        result = self._process_html_inline_code(result)
+
+        # Phase 4: <del>/<s> 删除线 → 加粗
+        result = self._process_html_strikethrough(result)
+
+        # Phase 5: 链接标准化
+        result = self._normalize_links(result)
+
+        return result.strip()
+
+    # ================================================================
+    #  代码块处理（Markdown 和 HTML 两套路径）
+    # ================================================================
+
+    def _process_code_blocks(self, text: str) -> str:
+        """
+        Markdown 代码块 ``` ... ``` → Base64 图片。
+        支持指定语言：```python, ```javascript 等。
+        """
+
+        def replace_code_block(match):
+            lang = match.group(1) or ""
+            code_content = match.group(2).rstrip("\n")
+
+            if not code_content.strip():
+                return ""
+
+            img_html = self._render_code_image(code_content, lang)
+            self.stats.code_blocks += 1
+            return img_html
+
+        # 匹配 fenced code block: ```lang\n...\n```
+        return re.sub(
+            r"```(\w*)\n([\s\S]*?)```",
+            replace_code_block,
+            text,
+            flags=re.MULTILINE,
+        )
+
+    def _process_html_code_blocks(self, html: str) -> str:
+        """HTML <pre><code>...</code></pre> → Base64 图片。"""
+
+        def replace_pre_block(match):
+            pre_content = match.group(1)
+            # 提取语言标识（通常在 class 里）
+            lang = ""
+            lang_match = re.search(r'language-(\w+)', pre_content)
+            if lang_match:
+                lang = lang_match.group(1)
+
+            # 提取纯代码内容（去掉标签）
+            code_match = re.search(r"<code[^>]*>([\s\S]*?)</code>", pre_content)
+            code_content = code_match.group(1) if code_match else pre_content
+            # HTML 解码常见实体
+            code_content = code_content.replace("&lt;", "<").replace("&gt;", ">")
+            code_content = code_content.replace("&amp;", "&").replace("&quot;", '"')
+
+            if not code_content.strip():
+                return match.group(0)  # 保持原样
+
+            img_html = self._render_code_image(code_content, lang)
+            self.stats.code_blocks += 1
+            return img_html
+
+        return re.sub(
+            r"<pre\b[^>]*>([\s\S]*?)</pre>",
+            replace_pre_block,
+            html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+    # ================================================================
+    #  表格处理
+    # ================================================================
+
+    def _process_tables(self, text: str) -> str:
+        """
+        Markdown 表格 → Base64 图片。
+
+        匹配标准 GFM 表格:
+        | Header1 | Header2 |
+        |---------|---------|
+        | Cell1   | Cell2   |
+        """
+
+        def find_table_end(start_idx: int, lines: List[str]) -> int:
+            """找到表格结束位置（连续表格行之后）。"""
+            i = start_idx
+            while i < len(lines):
+                line = lines[i].strip()
+                if line.startswith("|") or (
+                    line.startswith("-") or line.startswith(":")
+                    and "|" in line
+                ):
+                    i += 1
+                else:
+                    break
+            return i
+
+        lines = text.split("\n")
+        result_lines: List[str] = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # 检测表头行（至少包含一个 | 且非分隔符行）
+            if "|" in line and not re.match(r"^[\s|:\-]+$", line):
+                # 检查下一行是否是分隔符
+                if i + 1 < len(lines) and re.match(
+                    r"^[\s|:\-]+$", lines[i + 1].strip()
+                ):
+                    # 找到表格结束位置
+                    table_end = find_table_end(i + 2, lines)
+                    table_lines = lines[i : table_end]
+                    table_md = "\n".join(table_lines)
+
+                    img_html = self._render_table_image(table_md)
+                    if img_html:
+                        result_lines.append(img_html)
+                        self.stats.tables += 1
+                    else:
+                        result_lines.extend(table_lines)
+
+                    i = table_end
+                    continue
+
+            result_lines.append(lines[i])
+            i += 1
+
+        return "\n".join(result_lines)
+
+    def _process_html_tables(self, html: str) -> str:
+        """HTML <table>...</table> → Base64 图片。"""
+
+        def replace_table(match):
+            table_content = match.group(0)
+            img_html = self._render_table_from_html(table_content)
+            if img_html:
+                self.stats.tables += 1
+                return img_html
+            return match.group(0)  # 渲染失败则保持原样
+
+        return re.sub(
+            r"<table\b[\s\S]*?</table>",
+            replace_table,
+            html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+    # ================================================================
+    #  格式降级与标准化
+    # ================================================================
+
+    def _normalize_markdown_format(self, text: str) -> str:
+        """Markdown 格式降级处理。"""
+        # 行内代码 `code` → **code**
+        def replace_inline_code(m):
+            self.stats.inline_codes += 1
+            return f"**{m.group(1)}**"
+
+        text = re.sub(r"`([^`\n]+)`", replace_inline_code, text)
+
+        # 删除线 ~~text~~ → **text**
+        def replace_strikethrough(m):
+            self.stats.strikethroughs += 1
+            return f"**{m.group(1)}**"
+
+        text = re.sub(r"~~([^~]+)~~", replace_strikethrough, text)
+
+        # 链接处理
+        text = self._normalize_links(text)
+
+        return text
+
+    def _process_html_inline_code(self, html: str) -> str:
+        """HTML <code>（非 pre 内）→ <strong>。"""
+
+        def replace(m):
+            content = m.group(1)
+            # 跳过已经在 pre/code 块内的（已由 _process_html_code_blocks 处理）
+            if "</pre>" in html[: m.start()]:
+                last_pre_close = html.rfind("</pre>", 0, m.start())
+                last_pre_open = html.rfind("<pre", 0, m.start())
+                if last_pre_open > last_pre_close:
+                    return m.group(0)  # 在 pre 块内，跳过
+            self.stats.inline_codes += 1
+            return f"<strong>{content}</strong>"
+
+        return re.sub(r"<code>([\s\S]*?)</code>", replace, html)
+
+    def _process_html_strikethrough(self, html: str) -> str:
+        """HTML <del>/<s> → <strong>。"""
+
+        def replace(m):
+            self.stats.strikethroughs += 1
+            return f"<strong>{m.group(1)}</strong>"
+
+        html = re.sub(r"<del>([\s\S]*?)</del>", replace, html, flags=re.DOTALL)
+        html = re.sub(
+            r"<s>([\s\S]*?)</s>", replace, html, flags=re.DOTALL | re.IGNORECASE
+        )
+        return html
+
+    @staticmethod
+    def _normalize_links(text: str) -> str:
+        """链接标准化：保留小黑盒内部链接，外部链接展开。"""
+
+        def process_link(m):
+            link_text = m.group(1)
+            url = m.group(2)
+
+            # 保留小黑盒内部链接原格式
+            if re.match(
+                r"https?://www\.xiaoheihe\.cn/app/bbs/link/", url, re.IGNORECASE
+            ):
+                return m.group(0)
+
+            # 外部链接：展开显示
+            clean_url = url.split("?")[0]  # 去掉查询参数
+            return f"**{link_text}**（{clean_url}）"
+
+        # Markdown 格式 [text](url)
+        result = re.sub(r"\[([^\]]*)\]\(([^)]+)\)", process_link, text)
+
+        return result
+
+    def _process_local_images(self, text: str) -> str:
+        """本地/相对路径图片替换为文字提示。"""
+
+        def replace_local_img(m):
+            alt = m.group(1) or "图片"
+            src = m.group(2)
+            if src.startswith(("http://", "https://", "data:")):
+                return m.group(0)  # 远程图片保持不变
+            self.stats.images_fixed += 1
+            return f"\n（图片：{alt} {src}）\n"
+
+        return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_local_img, text)
+
+    @staticmethod
+    def _wrap_paragraphs(text: str) -> str:
+        """将裸文本段落包裹在 <p> 标签中。"""
+        lines = text.split("\n")
+        result: List[str] = []
+        current_para: List[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                if current_para:
+                    result.append(f"{''.join(current_para)}")
+                    current_para = []
+                continue
+
+            # 已经是 HTML 标签的行直接保留
+            if stripped.startswith("<") and not stripped.startswith("**"):
+                if current_para:
+                    result.append(f"{''.join(current_para)}")
+                    current_para = []
+                result.append(stripped)
+                continue
+
+            current_para.append(line)
+
+        if current_para:
+            result.append(f"{''.join(current_para)}")
+
+        return "\n".join(result)
+
+    # ================================================================
+    #  图片渲染引擎（需要 Pillow + Pygments）
+    # ================================================================
+
+    def _render_code_image(self, code: str, lang: str = "") -> str:
+        """
+        将代码渲染为带语法高亮的 PNG 图片，返回 HTML <img> 标签。
+        如果依赖不可用则回退到 <pre> 文本块。
+        """
+        if not (_PIL_AVAILABLE and _PYGMENTS_AVAILABLE):
+            # 回退：返回带样式的 pre 标签
+            escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            return (
+                f'<div style="background:{self.COLOR_CODE_BG};'
+                f"border-radius:8px;padding:16px;"
+                f'font-family:monospace;font-size:14px;'
+                f'overflow-x:auto;white-space:pre;">{escaped}</div>'
+            )
+
+        import pygments
+        from pygments.formatters import ImageFormatter
+        from pygments.lexers import get_lexer_by_name, guess_lexer
+        from PIL import Image as PILImage
+
+        try:
+            # 选择词法分析器
+            if lang:
+                try:
+                    lexer = get_lexer_by_name(lang, stripall=True)
+                except Exception:
+                    lexer = guess_lexer(code)
+            else:
+                lexer = guess_lexer(code)
+
+            # 配置图片格式化器
+            formatter = ImageFormatter(
+                style="github",
+                linenos=False,
+                font_size=14,
+                line_padding=4,
+                image_pad=16,
+                border_radius=8,
+                background_color=self.COLOR_CODE_BG,
+            )
+
+            # 渲染
+            png_data = pygments.highlight(code, lexer, formatter)
+
+            # 转 Base64
+            b64 = base64.b64encode(png_data).decode("ascii")
+            lang_label = lang or "code"
+
+            return (
+                f'<img src="data:image/png;base64,{b64}" '
+                f'alt="代码块 ({lang_label})" '
+                f'style="max-width:100%;border-radius:8px;" />'
+            )
+
+        except Exception:
+            # 渲染失败时回退
+            escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            return (
+                f'<div style="background:{self.COLOR_CODE_BG};'
+                f"border-radius:8px;padding:16px;"
+                f'font-family:monospace;font-size:14px;">{escaped}</div>'
+            )
+
+    def _render_table_image(self, table_md: str) -> Optional[str]:
+        """
+        将 Markdown 表格渲染为 PNG 图片，返回 HTML <img> 标签。
+        返回 None 表示渲染失败。
+        """
+        if not _PIL_AVAILABLE:
+            return None
+
+        parsed = self._parse_markdown_table(table_md)
+        if not parsed:
+            return None
+
+        headers, rows = parsed
+        return self._draw_table(headers, rows)
+
+    def _render_table_from_html(self, table_html: str) -> Optional[str]:
+        """将 HTML 表格渲染为 PNG 图片。"""
+        if not _PIL_AVAILABLE:
+            return None
+
+        headers, rows = self._parse_html_table(table_html)
+        if not rows and not headers:
+            return None
+
+        return self._draw_table(headers, rows)
+
+    # ================================================================
+    #  表格解析器
+    # ================================================================
+
+    @staticmethod
+    def _parse_markdown_table(md_text: str):
+        """
+        解析 Markdown GFM 表格。
+        返回 (headers: list[str], rows: list[list[str]]) 或 None。
+        """
+        lines = md_text.strip().split("\n")
+        if len(lines) < 2:
+            return None
+
+        def parse_row(line: str) -> List[str]:
+            cells = line.split("|")
+            cells = [c.strip() for c in cells]
+            # 去掉首尾空单元格
+            if cells and cells[0] == "":
+                cells.pop(0)
+            if cells and cells[-1] == "":
+                cells.pop()
+            return cells
+
+        headers = parse_row(lines[0])
+
+        # 跳过分隔符行
+        data_lines = [line for line in lines[1:] if not re.match(r"^[\s|:\-]+$", line)]
+        rows = [parse_row(line) for line in data_lines if line.strip()]
+
+        if not headers:
+            return None
+
+        return headers, rows
+
+    @staticmethod
+    def _parse_html_table(html: str):
+        """解析 HTML 表格。"""
+        headers: List[str] = []
+        rows: List[List[str]] = []
+
+        # 提取表头
+        th_matches = re.findall(r"<th[^>]*>([\s\S]*?)</th>", html, re.IGNORECASE)
+        headers = [
+            re.sub(r"<[^>]+>", "", h).strip() for h in th_matches if h.strip()
+        ]
+
+        # 提取行
+        tr_matches = re.findall(r"<tr[^>]*>([\s\S]*?)</tr>", html, re.IGNORECASE)
+        is_header_row = True
+        for tr in tr_matches:
+            td_matches = re.findall(
+                r"<t[dh][^>]*>([\s\S]*?)</t[dh]>", tr, re.IGNORECASE
+            )
+            cells = [
+                re.sub(r"<[^>]+>", "", cell).strip() for cell in td_matches if cell.strip()
+            ]
+            if not is_header_row and cells:
+                rows.append(cells)
+            is_header_row = False
+
+        return headers, rows
+
+    # ================================================================
+    #  表格绘制引擎（Pillow）
+    # ================================================================
+
+    def _draw_table(self, headers: List[str], rows: List[List[str]]) -> Optional[str]:
+        """用 Pillow 绘制表格并返回 Base64 HTML img 标签。"""
+        from PIL import Image, ImageDraw, ImageFont
+
+        try:
+            # 尝试加载字体
+            font = self._load_font(size=14)
+            bold_font = self._load_font(size=14, bold=True)
+            if not font or not bold_font:
+                font = bold_font = ImageFont.load_default()
+
+            all_rows = [headers] + rows
+
+            # 计算列宽
+            num_cols = max((len(row) for row in all_rows), default=0)
+            col_widths = [0] * num_cols
+
+            for row in all_rows:
+                for idx, cell in enumerate(row):
+                    if idx < num_cols:
+                        wrapped = self._wrap_text(cell, font, self.TABLE_MAX_WIDTH // num_cols)
+                        w = max(HeyBoxConverter._get_text_size(font, line)[0] for line in wrapped) if wrapped else 0
+                        col_widths[idx] = max(col_widths[idx], w)
+
+            # 加上内边距
+            col_widths = [w + self.TABLE_CELL_PADDING * 2 for w in col_widths]
+
+            total_width = min(sum(col_widths), self.TABLE_MAX_WIDTH)
+            header_h = self.TABLE_LINE_HEIGHT
+            row_h = self.TABLE_LINE_HEIGHT
+            total_height = header_h + row_h * len(rows) + 2  # 边框
+
+            # 创建画布
+            img = Image.new("RGB", (total_width, total_height), self.COLOR_BG)
+            draw = ImageDraw.Draw(img)
+
+            # 绘制表头背景
+            draw.rectangle([0, 0, total_width, header_h], fill=self.COLOR_TABLE_HEADER)
+            draw.line([0, header_h, total_width, header_h], fill=self.COLOR_TABLE_BORDER, width=1)
+
+            y = 0
+            for row_idx, row in enumerate(all_rows):
+                x = 0
+                f = bold_font if row_idx == 0 else font
+                for col_idx, cell in enumerate(row):
+                    if col_idx >= num_cols:
+                        break
+                    cw = col_widths[col_idx]
+                    # 文字绘制（左对齐，垂直居中）
+                    text_y = y + (header_h if row_idx == 0 else row_h) // 2 - (HeyBoxConverter._get_text_size(f, cell)[1] // 2)
+                    draw.text(
+                        (x + self.TABLE_CELL_PADDING, text_y),
+                        cell,
+                        fill=self.COLOR_TEXT,
+                        font=f,
+                    )
+                    # 列分隔线
+                    x += cw
+                    if col_idx < num_cols - 1:
+                        draw.line([x, y, x, y + (header_h if row_idx == 0 else row_h)],
+                                  fill=self.COLOR_TABLE_BORDER, width=1)
+
+                y += header_h if row_idx == 0 else row_h
+                # 行分隔线
+                if row_idx > 0:
+                    draw.line([0, y, total_width, y], fill=self.COLOR_TABLE_BORDER, width=1)
+
+            # 外边框
+            draw.rectangle([0, 0, total_width - 1, total_height - 1],
+                           outline=self.COLOR_TABLE_BORDER, width=1)
+
+            # 导出为 Base64
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+            return (
+                f'<img src="data:image/png;base64,{b64}" '
+                f'alt="表格" style="max-width:100%;" />'
+            )
+
+        except Exception as e:
+            logger_error = __import__("logging").getLogger(__name__).error
+            logger_error("表格渲染失败: %s", e)
+            return None
+
+    @staticmethod
+    def _get_text_size(font, text: str) -> tuple[int, int]:
+        """兼容 Pillow 9/10 的文字尺寸获取。"""
+        try:
+            # Pillow 9.x
+            return font.getsize(text)
+        except AttributeError:
+            # Pillow 10+: 用 textbbox
+            bbox = font.getbbox(text)
+            return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    @staticmethod
+    def _load_font(size: int = 14, bold: bool = False):
+        """尝试加载系统字体，失败返回 None。"""
+        from PIL import ImageFont
+
+        font_names = []
+        import platform
+        system = platform.system()
+
+        if system == "Windows":
+            font_names = ["msyh.ttc", "simhei.ttf"]  # 微软雅黑 / 黑体
+        elif system == "Darwin":  # macOS
+            font_names = ["PingFang SC.ttc", "Arial Unicode.ttf"]
+        else:  # Linux
+            font_names = [
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "DejaVuSans.ttf",
+            ]
+
+        for name in font_names:
+            try:
+                return ImageFont.truetype(name, size)
+            except (IOError, OSError):
+                continue
+
+        return None
+
+    @staticmethod
+    def _wrap_text(text: str, font, max_width: int) -> List[str]:
+        """按像素宽度自动折行（支持 CJK 字符）。"""
+        if not text:
+            return []
+
+        chars = list(text)
+        lines: List[str] = []
+        current_line = ""
+        current_width = 0
+
+        for char in chars:
+            char_w = HeyBoxConverter._get_text_size(font, char)[0]
+            # CJK 字符宽度约等于 2 个 ASCII 字符
+            char_w = char_w if ord(char) > 127 else char_w
+
+            if current_width + char_w > max_width and current_line:
+                lines.append(current_line)
+                current_line = char
+                current_width = char_w
+            else:
+                current_line += char
+                current_width += char_w
+
+        if current_line:
+            lines.append(current_line)
+
+        return lines if lines else [text]
