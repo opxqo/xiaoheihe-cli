@@ -82,25 +82,21 @@ class XiaoheiheClient:
         self._api_client.set_heybox_id(self._browser_manager.heybox_id)
         logger.info("Cookie 注入模式就绪 (heybox_id=%s)", self._browser_manager.heybox_id)
 
-    async def login(self, phone: str, code_callback=None) -> bool:
+    async def login(self, phone: str, code_callback=None, password=None) -> bool:
         """
-        手机号 + 验证码登录。
-        登录成功后自动保存 Cookie，后续可直接使用。
-
-        Args:
-            phone: 完整手机号（含区号），如 "+8613800138000"
-            code_callback: 异步回调返回验证码（None 则用 input 等待）
-
-        Returns:
-            True=登录成功, False=失败
+        手机号登录（支持密码或验证码模式）。
         """
         self._browser_manager = BrowserManager(headless=self.headless)
-        success = await self._browser_manager.login_with_phone(phone, code_callback)
-        if success:
+        result = await self._browser_manager.login_with_phone(
+            phone=phone,
+            code_callback=code_callback,
+            password=password,
+        )
+        if result:
             await self._browser_manager.start_session()
             self._api_client = XiaoheiheAPIClient(page=self._browser_manager.api_page)
             self._api_client.set_heybox_id(self._browser_manager.heybox_id)
-        return success
+        return result
 
     async def _connect_direct(self):
         """直连：初始化浏览器 + 单页会话"""
@@ -230,15 +226,13 @@ class XiaoheiheClient:
         if self.daemon_mode:
             return await self._daemon_request({"action": "get_article_list"})
 
-        # 优先使用 fetch 模式（不触发页面导航，不会弹验证码）
-        result = await self._api_client.call_api(
-            "/bbs/app/author/concept/article/list",
-            method="GET",
-        )
+        # 创作者接口需要 hkey 签名 → 必须用导航模式（不能用 fetch）
+        # 导航到创作者页面，拦截 /bbs/app/author/concept/article/list 响应
+        result = await self._api_client.get_article_list()
 
-        # fetch 失败时回退到传统导航模式
-        if not result:
-            logger.info("fetch 模式获取文章列表失败，尝试导航模式...")
+        if not result or result.get("status") == "relogin":
+            logger.warning("Cookie 可能已过期（relogin），尝试重新验证...")
+            # 尝试用导航模式重新获取
             result = await self._api_client.get_article_list()
 
         if not result:
@@ -290,12 +284,13 @@ class XiaoheiheClient:
         lid = result.get("link_id")
         if not lid:
             lid = (result.get("result") or {}).get("link_id")
+        raw_result = result.get("raw") if isinstance(result.get("raw"), dict) else result
         pr = PublishResult(
-            success=result.get("status") == "ok",
+            success=bool(result.get("success")) or result.get("status") == "ok",
             link_id=lid,
-            message=result.get("msg", ""),
+            message=result.get("message") or result.get("msg", ""),
             is_draft=draft,
-            raw=result,
+            raw=raw_result,
         )
         return pr.model_dump()
 
@@ -350,7 +345,18 @@ class DaemonServer:
 
     async def start(self):
         self._browser_manager = BrowserManager(headless=self.headless)
-        await self._browser_manager.init()
+        cookie_string = ""
+        try:
+            from config import get_cookie
+            cookie_string = get_cookie()
+        except Exception:
+            cookie_string = ""
+
+        if cookie_string:
+            await self._browser_manager.inject_cookies(cookie_string)
+            await self._browser_manager.start_session()
+        else:
+            await self._browser_manager.init()
         self._api_client = XiaoheiheAPIClient(page=self._browser_manager.api_page)
         self._api_client.set_heybox_id(self._browser_manager.heybox_id)
 
@@ -358,7 +364,7 @@ class DaemonServer:
 
         self._running = True
         server = await asyncio.start_server(self._handle_client, self.host, self.port)
-        addrs = ", ".join(str(s.getsockname()) for s in server.sockets())
+        addrs = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
         logger.info(f"守护进程监听: {addrs}")
 
         async with server:
@@ -513,11 +519,11 @@ class DaemonServer:
             if not lid:
                 lid = (result.get("result") or {}).get("link_id")
             pr = PublishResult(
-                success=result.get("status") == "ok",
+                success=bool(result.get("success")) or result.get("status") == "ok",
                 link_id=lid,
-                message=result.get("msg", ""),
+                message=result.get("message") or result.get("msg", ""),
                 is_draft=req.get("draft", True),
-                raw=result,
+                raw=result.get("raw") if isinstance(result.get("raw"), dict) else result,
             )
             return {"status": "ok", "data": pr.model_dump()}
         except Exception as e:

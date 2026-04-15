@@ -1,8 +1,8 @@
 """
-小黑盒 CLI v2.4 — 多子命令架构，服务器友好
-支持守护模式、多种输出格式、Cookie 自动管理
-
+小黑盒 CLI v2.5 — 多子命令架构，支持密码登录
 用法:
+    xiaoheihe login --phone 13800138000 --password "你的密码"  # 密码登录（推荐）
+    xiaoheihe login --phone 13800138000                    # 验证码登录
     xiaoheihe get 179245676              # 获取帖子
     xiaoheihe get 179245676 --full       # 完整帖子（含所有评论）
     xiaoheihe comments 179245676         # 只看评论
@@ -11,7 +11,6 @@
     xiaoheihe status                     # 查看守护进程状态
     xiaoheihe list                       # 查看我的文章列表
     xiaoheihe pub "标题" -c "<p>内容</p>" # 发布文章
-    XHH_COOKIE="xxx" xiaoheihe list      # 环境变量 Cookie（服务器部署推荐）
 """
 from __future__ import annotations
 
@@ -43,6 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ANSI 颜色
+RED = "\033[31m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 CYAN = "\033[36m"
@@ -260,7 +260,11 @@ class OutputFormatter:
 
         sources = article.get("flow_source_info", [])
         if sources:
-            src_str = "  ".join(f"{s['text']}:{s['value']}%" for s in sources)
+            src_str = "  ".join(
+                f"{(s.get('text') if isinstance(s, dict) else getattr(s, 'text', '?'))}:"
+                f"{(s.get('value') if isinstance(s, dict) else getattr(s, 'value', '?'))}%"
+                for s in sources
+            )
             print(f"\n  \U0001f4cd 流量来源: {src_str}")
 
         trends = data.get("data_trends", [])
@@ -268,12 +272,25 @@ class OutputFormatter:
             print(f"\n  \U0001f4c8 近 {len(trends)} 日趋势:")
             print(f"  {'日期':<12} {'浏览':>6} {'评论':>5} {'分享':>5} {'收藏':>5} {'点赞':>5}")
             for t in trends[-7:]:
-                ts = t.timestamp
+                if isinstance(t, dict):
+                    ts = t.get("timestamp", 0)
+                    click = t.get("click", 0)
+                    comment = t.get("comment", 0)
+                    share = t.get("share", 0)
+                    favour = t.get("favour", 0)
+                    award = t.get("award", 0)
+                else:
+                    ts = t.timestamp
+                    click = t.click
+                    comment = t.comment
+                    share = t.share
+                    favour = t.favour
+                    award = t.award
                 date_str = _format_time_abs(ts)[:10] if ts else "?"
                 print(
-                    f"  {date_str:<12} {t.click:>6} "
-                    f"{t.comment:>5} {t.share:>5} "
-                    f"{t.favour:>5} {t.award:>5}"
+                    f"  {date_str:<12} {click:>6} "
+                    f"{comment:>5} {share:>5} "
+                    f"{favour:>5} {award:>5}"
                 )
 
         print(color("═" * min(w, 70), CYAN))
@@ -288,10 +305,10 @@ class OutputFormatter:
             print("\n  暂无已发布的文章")
             return
 
-        w = os.get_terminal_size().columns if sys.stdout.isatty() else 100
+        w = os.get_terminal_size().columns if sys.stdout.isatty() else 110
         print()
         print(color(f"  \U0001f4dd 我的文章 ({total} 篇)", BOLD))
-        print(color("─" * min(w, 85), DIM))
+        print(color("─" * min(w, 98), DIM))
 
         total_views = sum(a.get("click", 0) for a in articles)
         total_likes = sum(a.get("thumbs", 0) for a in articles)
@@ -304,10 +321,11 @@ class OutputFormatter:
             f"  | 总评论: {total_comments}"
             f"  | 有效阅读: {format_number(total_reads)}"
         )
-        print(color("─" * min(w, 85), DIM))
+        print(color("─" * min(w, 98), DIM))
 
         header = (
             f"  {'#':<3} "
+            f"{'ID':<10} "
             f"{'标题':<30} "
             f"{'类型':<4} "
             f"{'浏览':>7} "
@@ -317,7 +335,7 @@ class OutputFormatter:
             f"{'发布时间':<14}"
         )
         print(header)
-        print(color("─" * min(w, 85), DIM))
+        print(color("─" * min(w, 98), DIM))
 
         for i, art in enumerate(articles):
             title = truncate_text(art.get("title", "(无标题)"), max_len=28)
@@ -325,6 +343,7 @@ class OutputFormatter:
             abs_time = _format_time_abs(art.get("create_at"))
             print(
                 f"  {i + 1:<3} "
+                f"{str(art.get('link_id', '')):<10} "
                 f"{color(title, BOLD):<30} "
                 f"{link_type:<4} "
                 f"{format_number(art.get('click', 0)):>7} "
@@ -334,7 +353,7 @@ class OutputFormatter:
                 f"{abs_time or '':<14}"
             )
 
-        print(color("─" * min(w, 85), DIM))
+        print(color("─" * min(w, 98), DIM))
         print()
 
     @staticmethod
@@ -397,17 +416,25 @@ class _ClientCtx:
 
     def __init__(self, args):
         self.args = args
+        self._cookie_override = bool(getattr(args, "cookie", None))
         self._cookie = get_cookie(getattr(args, "cookie", None))
-        self._use_daemon = _check_daemon() if not self._cookie else False
+        self._use_daemon = _check_daemon() and not self._cookie_override
         self._client: Optional[XiaoheiheClient] = None
 
     async def __aenter__(self) -> XiaoheiheClient:
+        if self._use_daemon:
+            self._client = XiaoheiheClient(headless=self.args.headless, daemon=True)
+            try:
+                await self._client.connect()
+                return self._client
+            except Exception as e:
+                logger.warning("守护进程连接失败，回退到本地 Cookie 会话: %s", e)
+                await self._client.close()
+                self._client = None
+
         if self._cookie:
             self._client = XiaoheiheClient(headless=self.args.headless)
             await self._client.connect_with_cookies(self._cookie)
-        elif self._use_daemon:
-            self._client = XiaoheiheClient(headless=self.args.headless, daemon=True)
-            await self._client.connect()
         else:
             self._client = XiaoheiheClient(headless=self.args.headless)
             await self._client.connect()
@@ -462,7 +489,7 @@ async def cmd_creator(args):
 async def cmd_list(args):
     async with _ClientCtx(args) as c:
         data = await c.get_my_articles()
-        _output(data, args.format, args.output, "article_list")
+        _output(data, getattr(args, "format", "table"), getattr(args, "output", None), "article_list")
 
 
 async def cmd_publish(args):
@@ -539,20 +566,22 @@ async def cmd_publish(args):
 
 async def cmd_login(args):
     """
-    手机号验证码登录。
+    手机号登录（支持密码或验证码）。
     登录成功后 Cookie 自动保存，后续命令无需再登录。
-    支持服务器 headless 模式（通过 stdin 输入验证码）。
     """
     from browser_manager import BrowserManager
 
     phone = getattr(args, "phone", "")
     if not phone:
-        print(color("  ❌ 请提供手机号: --phone +8613800138000", RED))
+        print(color("  ❌ 请提供手机号: --phone 13800138000", RED))
         return
 
     bm = BrowserManager(headless=args.headless)
     try:
-        success = await bm.login_with_phone(phone)
+        success = await bm.login_with_phone(
+            phone=phone,
+            password=getattr(args, "password", None),
+        )
     finally:
         await bm.close()
 
@@ -574,7 +603,8 @@ async def cmd_login(args):
             OutputFormatter.json(result, args.output)
     else:
         print(f"\n{color('  ❌ 登录失败', RED)}")
-        print("   可尝试: python cli.py login --phone <号码> (不带 --headless 弹出浏览器)")
+        print("   提示: 密码登录用 --password '你的密码'")
+        print("         验证码登录不加 --password 即可")
         result = {
             "status": "error",
             "message": "登录失败",
@@ -616,52 +646,54 @@ async def cmd_serve(args):
 
 def cmd_status(args):
     pid_path = get_daemon_pid_path()
-    if not os.path.exists(pid_path):
-        print(color("  ● 守护进程未运行", YELLOW))
-        print(f"     启动: xiaoheihe serve")
+    health = _daemon_health()
+    if health:
+        print(color("  ● 守护进程运行中", GREEN))
+        if os.path.exists(pid_path):
+            try:
+                with open(pid_path) as f:
+                    pid = int(f.read().strip())
+                print(f"     PID: {pid}")
+            except Exception:
+                pass
+
+        info = health.get("data", {})
+        print(f"     Heybox ID: {info.get('heybox_id', '?')}")
+        print(f"     Cookie 有效: {'是' if info.get('cookies_valid') else '否'}")
         return
 
-    try:
-        with open(pid_path) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-
-        print(color("  ● 守护进程运行中", GREEN))
-        print(f"     PID: {pid}")
-
-        try:
-            import socket as _sock
-            sock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-            sock.settimeout(2)
-            sock.connect(("127.0.0.1", 19810))
-            sock.sendall(json.dumps({"action": "health"}).encode() + b"\n")
-            data = sock.recv(4096).decode().strip()
-            sock.close()
-            health = json.loads(data)
-            info = health.get("data", {})
-            print(f"     Heybox ID: {info.get('heybox_id', '?')}")
-            print(f"     Cookie 有效: {'是' if info.get('cookies_valid') else '否'}")
-        except Exception:
-            pass
-    except (ProcessLookupError, OSError, PermissionError):
+    if os.path.exists(pid_path):
         print(color("  ● 守护进程僵尸（PID文件残留）", YELLOW))
         print(f"     清理: del {pid_path}")
+    else:
+        print(color("  ● 守护进程未运行", YELLOW))
+        print(f"     启动: xiaoheihe serve")
 
 
 # ==================== 工具函数 ====================
+
+
+def _daemon_health(timeout: float = 2.0) -> Optional[dict]:
+    try:
+        import socket as _sock
+        sock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(("127.0.0.1", 19810))
+        sock.sendall(json.dumps({"action": "health"}).encode() + b"\n")
+        data = sock.recv(4096).decode().strip()
+        sock.close()
+        if not data:
+            return None
+        return json.loads(data)
+    except Exception:
+        return None
 
 
 def _check_daemon() -> bool:
     pid_path = get_daemon_pid_path()
     if not os.path.exists(pid_path):
         return False
-    try:
-        with open(pid_path) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, OSError, PermissionError, ValueError):
-        return False
+    return _daemon_health(timeout=0.6) is not None
 
 
 def _batch_output(results, args):
@@ -694,7 +726,7 @@ def _output(data: dict, fmt: str, out_file: Optional[str] = None, data_type: str
 # ==================== 主入口 ====================
 
 
-_VERSION = "v2.4"
+_VERSION = "v2.5"
 
 _CMD_ALIASES = {
     "g": "get",
@@ -728,6 +760,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""\
 示例:
+  %(prog)s login --phone 13800138000 --password "xxx"   密码登录（推荐）
+  %(prog)s login --phone 13800138000                  验证码登录
   %(prog)s get 179245676                  获取帖子（JSON输出）
   %(prog)s get 179245676 -f table          获取帖子（表格显示）
   %(prog)s get 179245676 --full           获取完整帖子
@@ -759,6 +793,8 @@ def main():
     p_get = subparsers.add_parser("get", aliases=["g"], help="获取帖子详情")
     p_get.add_argument("post_id", help="帖子ID或URL")
     p_get.add_argument("--full", action="store_true", help="包含全部评论")
+    p_get.add_argument("-f", "--format", choices=["json", "table", "csv"],
+                        default="json", help="输出格式（默认json）")
 
     # --- comments ---
     p_com = subparsers.add_parser("comments", aliases=["c"], help="获取评论")
@@ -785,14 +821,23 @@ def main():
     # --- creator ---
     p_cre = subparsers.add_parser("creator", aliases=["cr"], help="创作者后台数据")
     p_cre.add_argument("post_id", help="帖子ID或URL")
+    p_cre.add_argument("-f", "--format", choices=["json", "table", "csv"],
+                        default="table", help="输出格式（默认table）")
+    p_cre.add_argument("-o", "--output", default=None, help="输出文件路径")
 
     # --- list ---
-    subparsers.add_parser("list", aliases=["ls"], help="查看已发布文章列表")
+    p_list = subparsers.add_parser("list", aliases=["ls"], help="查看已发布文章列表")
+    p_list.add_argument("-f", "--format", choices=["json", "table", "csv"],
+                        default="table", help="输出格式（默认table）")
+    p_list.add_argument("-o", "--output", default=None, help="输出文件路径")
+
 
     # --- login ---
-    p_login = subparsers.add_parser("login", aliases=["li"], help="手机号验证码登录")
+    p_login = subparsers.add_parser("login", aliases=["li"], help="手机号登录（密码或验证码）")
     p_login.add_argument("--phone", required=True,
-                         help="手机号（含区号），如 +8613800138000 或 +49123456789")
+                         help="手机号，如 13800138000")
+    p_login.add_argument("--password", default=None,
+                         help="登录密码（提供则使用密码模式，不提供则用验证码模式）")
 
     # --- publish ---
     p_pub = subparsers.add_parser("publish", aliases=["pub"], help="发布/保存草稿")
