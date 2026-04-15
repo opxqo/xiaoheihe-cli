@@ -30,9 +30,13 @@ from __future__ import annotations
 import base64
 import html as html_lib
 import io
+import mimetypes
+import os
 import re
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+import requests
 
 # 延迟导入，避免无 GUI 环境报错
 _PIL_AVAILABLE = False
@@ -74,6 +78,8 @@ class ConvertStats:
     strikethroughs: int = 0       # 删除线降级数量
     links_fixed: int = 0          # 链接修复数量
     images_fixed: int = 0         # 图片修复数量
+    images_embedded: int = 0      # 图片转为 data URL
+    images_skipped: int = 0       # 图片无法内嵌
 
     def summary(self) -> str:
         parts = []
@@ -89,6 +95,10 @@ class ConvertStats:
             parts.append(f"链接修复{self.links_fixed}")
         if self.images_fixed:
             parts.append(f"图片修复{self.images_fixed}")
+        if self.images_embedded:
+            parts.append(f"图片内嵌{self.images_embedded}")
+        if self.images_skipped:
+            parts.append(f"图片降级{self.images_skipped}")
         return ", ".join(parts) if parts else "无需转换"
 
 
@@ -116,6 +126,9 @@ class HeyBoxConverter:
     COLOR_TABLE_BORDER = "#e0e0e0"
     COLOR_TEXT = "#333333"
     COLOR_CODE_BG = "#f6f8fa"
+    MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
+    REMOTE_IMAGE_TIMEOUT = 12
+    INTERNAL_IMAGE_HOST_SUFFIXES = ("xiaoheihe.cn", "max-c.com")
 
     def __init__(self):
         self.stats = ConvertStats()
@@ -224,16 +237,19 @@ class HeyBoxConverter:
         # Phase 2: <table> 表格 → 图片
         result = self._process_html_tables(result)
 
-        # Phase 3: <code> 行内代码 → 加粗
+        # Phase 3: 尽量将站外图/本地图转成 data URL，减少发稿后失效
+        result = self._inline_html_images(result)
+
+        # Phase 4: <code> 行内代码 → 加粗
         result = self._process_html_inline_code(result)
 
-        # Phase 4: <del>/<s> 删除线 → 加粗
+        # Phase 5: <del>/<s> 删除线 → 加粗
         result = self._process_html_strikethrough(result)
 
-        # Phase 5: 链接标准化
+        # Phase 6: 链接标准化
         result = self._normalize_links(result)
 
-        # Phase 6: 输出结构收敛为更保守的 HTML 子集
+        # Phase 7: 输出结构收敛为更保守的 HTML 子集
         result = self._normalize_html_structure(result)
 
         return result.strip()
@@ -437,8 +453,12 @@ class HeyBoxConverter:
         """链接标准化：保留小黑盒内部链接，外部链接展开。"""
 
         def process_markdown_link(m):
-            link_text = m.group(1)
-            url = m.group(2).strip()
+            is_image = m.group(1) == "!"
+            link_text = m.group(2)
+            url = m.group(3).strip()
+
+            if is_image:
+                return m.group(0)
 
             if re.match(
                 r"https?://www\.xiaoheihe\.cn/app/bbs/link/", url, re.IGNORECASE
@@ -466,7 +486,7 @@ class HeyBoxConverter:
             safe_url = html_lib.escape(clean_url)
             return f"<strong>{safe_text}</strong>（{safe_url}）"
 
-        result = re.sub(r"\[([^\]]*)\]\(([^)]+)\)", process_markdown_link, text)
+        result = re.sub(r"(!?)\[([^\]]*)\]\(([^)]+)\)", process_markdown_link, text)
         result = re.sub(
             r"<a\b([^>]*?)href=(['\"])(.*?)\2[^>]*>([\s\S]*?)</a>",
             process_html_link,
@@ -477,17 +497,22 @@ class HeyBoxConverter:
         return result
 
     def _process_local_images(self, text: str) -> str:
-        """本地/相对路径图片替换为文字提示。"""
+        """将 Markdown 图片尽量转换为小黑盒更容易接受的形式。"""
 
-        def replace_local_img(m):
-            alt = m.group(1) or "图片"
-            src = m.group(2)
-            if src.startswith(("http://", "https://", "data:")):
-                return m.group(0)  # 远程图片保持不变
+        def replace_markdown_img(match):
+            alt = (match.group(1) or "图片").strip()
+            src = (match.group(2) or "").strip()
+            resolved_src = self._resolve_image_source(src)
+
+            if resolved_src:
+                if resolved_src != src:
+                    self.stats.images_fixed += 1
+                return f"![{alt}]({resolved_src})"
+
             self.stats.images_fixed += 1
             return f"\n（图片：{alt} {src}）\n"
 
-        return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_local_img, text)
+        return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_markdown_img, text)
 
     @staticmethod
     def _wrap_paragraphs(text: str) -> str:
@@ -584,6 +609,118 @@ class HeyBoxConverter:
     def _sanitize_anchor_open_tag(match) -> str:
         href = html_lib.escape(html_lib.unescape(match.group(2)), quote=True)
         return f'<a href="{href}">'
+
+    def _inline_html_images(self, html: str) -> str:
+        """将 HTML 中的图片地址尽量转成可直接发布的 data URL。"""
+
+        def replace_img(match):
+            tag = match.group(0)
+            src_match = re.search(r"\bsrc=(['\"])(.*?)\1", tag, flags=re.IGNORECASE)
+            if not src_match:
+                return ""
+
+            raw_src = html_lib.unescape(src_match.group(2)).strip()
+            alt_match = re.search(r"\balt=(['\"])(.*?)\1", tag, flags=re.IGNORECASE)
+            alt = html_lib.unescape(alt_match.group(2)).strip() if alt_match else "图片"
+            resolved_src = self._resolve_image_source(raw_src)
+
+            if not resolved_src:
+                self.stats.images_fixed += 1
+                safe_alt = html_lib.escape(alt)
+                safe_src = html_lib.escape(raw_src)
+                return f"<p>（图片：{safe_alt} {safe_src}）</p>"
+
+            if resolved_src != raw_src:
+                self.stats.images_fixed += 1
+
+            safe_src = html_lib.escape(resolved_src, quote=True)
+            safe_alt = html_lib.escape(alt, quote=True)
+            return f'<img src="{safe_src}" alt="{safe_alt}" />'
+
+        return re.sub(r"<img\b[^>]*>", replace_img, html, flags=re.IGNORECASE)
+
+    def _resolve_image_source(self, src: str) -> Optional[str]:
+        src = html_lib.unescape((src or "").strip())
+        if not src:
+            return None
+
+        if src.startswith("data:image/"):
+            return src
+
+        if self._is_internal_image_url(src):
+            return src
+
+        if re.match(r"^https?://", src, re.IGNORECASE):
+            return self._download_remote_image_as_data_url(src)
+
+        return self._read_local_image_as_data_url(src)
+
+    def _read_local_image_as_data_url(self, src: str) -> Optional[str]:
+        path_str = src
+        if src.startswith("file://"):
+            path_str = re.sub(r"^file://", "", src, flags=re.IGNORECASE)
+            if os.name == "nt" and re.match(r"^/[A-Za-z]:", path_str):
+                path_str = path_str[1:]
+
+        path_str = os.path.expanduser(path_str)
+        if not os.path.isabs(path_str):
+            path_str = os.path.join(os.getcwd(), path_str)
+
+        if not os.path.isfile(path_str):
+            self.stats.images_skipped += 1
+            return None
+
+        try:
+            if os.path.getsize(path_str) > self.MAX_INLINE_IMAGE_BYTES:
+                self.stats.images_skipped += 1
+                return None
+
+            mime_type = mimetypes.guess_type(path_str)[0] or "application/octet-stream"
+            if not mime_type.startswith("image/"):
+                self.stats.images_skipped += 1
+                return None
+
+            with open(path_str, "rb") as f:
+                raw = f.read()
+
+            self.stats.images_embedded += 1
+            return f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}"
+        except OSError:
+            self.stats.images_skipped += 1
+            return None
+
+    def _download_remote_image_as_data_url(self, src: str) -> Optional[str]:
+        try:
+            response = requests.get(
+                src,
+                timeout=self.REMOTE_IMAGE_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            response.raise_for_status()
+        except Exception:
+            self.stats.images_skipped += 1
+            return None
+
+        content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if not content_type.startswith("image/"):
+            self.stats.images_skipped += 1
+            return None
+
+        content = response.content
+        if len(content) > self.MAX_INLINE_IMAGE_BYTES:
+            self.stats.images_skipped += 1
+            return None
+
+        self.stats.images_embedded += 1
+        return f"data:{content_type};base64,{base64.b64encode(content).decode('ascii')}"
+
+    def _is_internal_image_url(self, src: str) -> bool:
+        match = re.match(r"^https?://([^/]+)", src, re.IGNORECASE)
+        if not match:
+            return False
+
+        host = match.group(1).lower()
+        return any(host.endswith(suffix) for suffix in self.INTERNAL_IMAGE_HOST_SUFFIXES)
 
     # ================================================================
     #  图片渲染引擎（需要 Pillow + Pygments）

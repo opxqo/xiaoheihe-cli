@@ -269,12 +269,19 @@ class DataParser:
     def _parse_link_meta(link_data: dict) -> dict:
         """从 result.link 解析帖子元数据"""
         if not link_data or not isinstance(link_data, dict):
+            logger.warning("_parse_link_meta 收到空或非dict数据: type=%s", type(link_data))
             return {}
 
         create_at = link_data.get("create_at", 0)
         user_data = link_data.get("user", {})
         topics = link_data.get("topics", [])
         text_data = link_data.get("text", "")
+
+        # 调试：记录原始 link 数据的 keys
+        logger.debug("link_data keys=%s, title='%s', user_keys=%s",
+                     list(link_data.keys())[:15],
+                     str(link_data.get('title', ''))[:50],
+                     list(user_data.keys())[:10] if isinstance(user_data, dict) else user_data)
 
         content_text = ""
         images: List[dict] = []

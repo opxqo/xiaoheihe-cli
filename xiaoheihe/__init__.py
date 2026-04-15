@@ -24,6 +24,7 @@ from typing import Optional, List, Dict, Any
 
 from browser_manager import BrowserManager
 from api_client import XiaoheiheAPIClient
+from config import get_cookie
 from data_parser import DataParser
 from utils import extract_link_id, get_daemon_pid_path
 
@@ -101,15 +102,23 @@ class XiaoheiheClient:
     async def _connect_direct(self):
         """直连：初始化浏览器 + 单页会话"""
         self._browser_manager = BrowserManager(headless=self.headless)
-        await self._browser_manager.init()
+        session_started = False
+        cookie_string = get_cookie()
+        if cookie_string:
+            await self._browser_manager.inject_cookies(cookie_string)
+            await self._browser_manager.start_session()
+            session_started = True
+        else:
+            await self._browser_manager.init()
         self._api_client = XiaoheiheAPIClient(page=self._browser_manager.api_page)
         self._api_client.set_heybox_id(self._browser_manager.heybox_id)
 
         # 启动单页会话模式：导航一次首页后常驻，后续 API 全走 fetch
-        try:
-            await self._browser_manager.start_session()
-        except Exception as e:
-            logger.warning("单页会话启动失败，回退到传统导航模式: %s", e)
+        if not session_started:
+            try:
+                await self._browser_manager.start_session()
+            except Exception as e:
+                logger.warning("单页会话启动失败，回退到传统导航模式: %s", e)
 
     async def _connect_daemon(self):
         """守护模式：通过 TCP 连接"""

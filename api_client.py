@@ -7,8 +7,11 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import json
 import logging
+import os
+import re
 import urllib.parse
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -19,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://www.xiaoheihe.cn"
 _API_BASE = "https://api.xiaoheihe.cn"
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 
 
 class XiaoheiheAPIClient:
@@ -150,7 +154,12 @@ class XiaoheiheAPIClient:
         heybox_id = cookie_dict.get("user_heybox_id") or cookie_dict.get("heybox_id") or "0"
         device_id = cookie_dict.get("device_id") or "02f61cdb0c14c026f9e6865d7744b86e"
 
-        text_json = json.dumps([{"text": html_content, "type": "html"}], ensure_ascii=False)
+        text_blocks = (
+            self._build_editor_blocks(html_content)
+            if self._env_flag("XHH_STRUCTURED_BLOCKS")
+            else [{"text": html_content, "type": "html"}]
+        )
+        text_json = json.dumps(text_blocks, ensure_ascii=False)
         post_body = {
             "text": text_json,
             "title": title,
@@ -245,6 +254,90 @@ class XiaoheiheAPIClient:
         msg = result.get("msg") or result.get("message") or "发布失败"
         logger.warning("❌ %s失败: %s", action, msg)
         return {"success": False, "message": msg, "is_draft": draft, "raw": result}
+
+    @staticmethod
+    def _env_flag(name: str) -> bool:
+        value = os.environ.get(name, "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _build_editor_blocks(html_content: str) -> list[dict]:
+        normalized = XiaoheiheAPIClient._unwrap_image_only_paragraphs(html_content or "")
+        blocks: list[dict] = []
+        last_index = 0
+
+        for match in _IMG_TAG_RE.finditer(normalized):
+            if XiaoheiheAPIClient._is_inside_text_container(normalized, match.start()):
+                continue
+
+            img_block = XiaoheiheAPIClient._img_tag_to_block(match.group(0))
+            if not img_block:
+                continue
+
+            XiaoheiheAPIClient._append_html_block(blocks, normalized[last_index:match.start()])
+            blocks.append(img_block)
+            last_index = match.end()
+
+        XiaoheiheAPIClient._append_html_block(blocks, normalized[last_index:])
+        return blocks or [{"text": html_content or "", "type": "html"}]
+
+    @staticmethod
+    def _append_html_block(blocks: list[dict], fragment: str) -> None:
+        fragment = re.sub(r"<p>\s*</p>", "", (fragment or ""), flags=re.IGNORECASE).strip()
+        if not fragment:
+            return
+
+        if blocks and blocks[-1].get("type") == "html":
+            blocks[-1]["text"] = f"{blocks[-1]['text']}{fragment}"
+        else:
+            blocks.append({"text": fragment, "type": "html"})
+
+    @staticmethod
+    def _unwrap_image_only_paragraphs(html_content: str) -> str:
+        def replace_paragraph(match):
+            inner = match.group(1)
+            stripped = re.sub(r"<img\b[^>]*>", "", inner, flags=re.IGNORECASE)
+            stripped = re.sub(r"<br\s*/?>", "", stripped, flags=re.IGNORECASE)
+            if stripped.strip():
+                return match.group(0)
+            return inner.strip()
+
+        return re.sub(
+            r"<p>([\s\S]*?)</p>",
+            replace_paragraph,
+            html_content or "",
+            flags=re.IGNORECASE,
+        )
+
+    @staticmethod
+    def _img_tag_to_block(tag: str) -> Optional[dict]:
+        src_match = re.search(r"\bsrc=(['\"])(.*?)\1", tag, flags=re.IGNORECASE)
+        if not src_match:
+            return None
+
+        src = html_lib.unescape(src_match.group(2)).strip()
+        if not src or not XiaoheiheAPIClient._is_supported_editor_image(src):
+            return None
+
+        return {"url": src, "width": None, "height": None, "type": "img"}
+
+    @staticmethod
+    def _is_supported_editor_image(src: str) -> bool:
+        if src.startswith("data:image/"):
+            return True
+
+        host = (urllib.parse.urlparse(src).hostname or "").lower()
+        return host.endswith("xiaoheihe.cn") or host.endswith("max-c.com")
+
+    @staticmethod
+    def _is_inside_text_container(html_content: str, index: int) -> bool:
+        container_tags = ("p", "li", "blockquote", "td", "th", "h1", "h2", "h3", "h4", "h5", "h6")
+        for tag in container_tags:
+            last_open = html_content.rfind(f"<{tag}", 0, index)
+            last_close = html_content.rfind(f"</{tag}>", 0, index)
+            if last_open > last_close:
+                return True
+        return False
 
     async def _get_signature_query_params(
         self,
