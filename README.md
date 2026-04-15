@@ -88,6 +88,54 @@ async def main():
 asyncio.run(main())
 ```
 
+### 4.1 服务器侧发布文章的重要说明
+
+`XiaoheiheClient.publish()` 接收的是“最终 HTML”，不会自动把 Markdown 转成小黑盒兼容格式。
+
+如果你在服务器代码里直接这样写：
+
+```python
+await client.publish(title="标题", html_content=markdown_text, draft=True)
+```
+
+那小黑盒拿到的其实是“被当成 HTML 的 Markdown 原文”，格式很容易错乱。
+
+服务器侧推荐改用：
+
+```python
+async with XiaoheiheClient(headless=True) as client:
+    result = await client.publish_markdown(
+        title="服务器文章",
+        markdown_content=markdown_text,
+        draft=True,
+    )
+```
+
+或者：
+
+```python
+async with XiaoheiheClient(headless=True) as client:
+    result = await client.publish_content(
+        title="服务器文章",
+        content=raw_content,
+        source_format="auto",
+        draft=True,
+    )
+```
+
+两者都会先调用 `HeyBoxConverter`，再发布到小黑盒。
+
+另外，服务器上请确认以下依赖已经安装完整，否则代码块/表格会退化：
+
+```bash
+python - <<'PY'
+import markdown
+import PIL
+import pygments
+print("deps ok")
+PY
+```
+
 ### 5. RESTful API 服务
 
 ```bash

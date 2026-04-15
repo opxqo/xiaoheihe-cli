@@ -250,6 +250,23 @@ class XiaoheiheClient:
         article_list = DataParser.parse_article_list_response(result)
         return article_list.model_dump()
 
+    @staticmethod
+    def render_article_content(
+        content: str,
+        source_format: str = "auto",
+    ) -> tuple[str, str]:
+        """
+        将 Markdown/HTML/混合内容转换成更适合小黑盒发布的 HTML。
+
+        Returns:
+            (html_content, convert_stats_summary)
+        """
+        from markdown_converter import HeyBoxConverter
+
+        converter = HeyBoxConverter()
+        html_content = converter.convert(content, source_format=source_format)
+        return html_content, converter.stats.summary()
+
     async def publish(
         self,
         title: str,
@@ -302,6 +319,51 @@ class XiaoheiheClient:
             raw=raw_result,
         )
         return pr.model_dump()
+
+    async def publish_content(
+        self,
+        title: str,
+        content: str,
+        *,
+        source_format: str = "auto",
+        link_tag: int = 11,
+        draft: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        先做格式转换，再发布内容。
+
+        适合服务器侧接入，避免直接把 Markdown 当作 HTML 发给小黑盒。
+        """
+        html_content, convert_stats = self.render_article_content(
+            content,
+            source_format=source_format,
+        )
+        result = await self.publish(
+            title=title,
+            html_content=html_content,
+            link_tag=link_tag,
+            draft=draft,
+        )
+        result["convert_stats"] = convert_stats
+        result["source_format"] = source_format
+        return result
+
+    async def publish_markdown(
+        self,
+        title: str,
+        markdown_content: str,
+        *,
+        link_tag: int = 11,
+        draft: bool = True,
+    ) -> Dict[str, Any]:
+        """将 Markdown 转成小黑盒兼容 HTML 后再发布。"""
+        return await self.publish_content(
+            title=title,
+            content=markdown_content,
+            source_format="markdown",
+            link_tag=link_tag,
+            draft=draft,
+        )
 
     @staticmethod
     def _send(sock: stdlib_socket.socket, msg: str) -> None:
