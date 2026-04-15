@@ -16,7 +16,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import shlex
+import sys
 from pathlib import Path
 from typing import Optional, List
 
@@ -26,6 +29,29 @@ logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://www.xiaoheihe.cn"
 _API_BASE = "https://api.xiaoheihe.cn"
+
+
+def _is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _has_display_server() -> bool:
+    return any(os.environ.get(name) for name in ("DISPLAY", "WAYLAND_DISPLAY", "MIR_SOCKET"))
+
+
+def _is_root_user() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    if not callable(geteuid):
+        return False
+    try:
+        return geteuid() == 0
+    except Exception:
+        return False
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 class BrowserManager:
@@ -65,19 +91,25 @@ class BrowserManager:
             self._cookies = saved_cookies
             self._heybox_id = self._extract_heybox_id(saved_cookies)
 
-            if await self._verify_cookies():
+            if await self.validate_cookies():
                 logger.info("Cookie 有效，直接使用 API 模式")
-                await self._ensure_api_page()
                 return
 
             logger.warning("Cookie 已过期，需要重新登录")
             self._cookies = []
             self._heybox_id = None
 
+        if self.headless:
+            raise RuntimeError(
+                "未找到有效 Cookie，且当前为无头模式，无法进入手动登录。"
+                "请先使用 `xiaoheihe login --cookie-file <path>` 导入 Cookie，"
+                "或执行 `xiaoheihe login --phone <手机号> --password <密码> --headless`。"
+            )
+
         # 无有效 Cookie，打开浏览器让用户登录
         await self.open_browser_for_login()
 
-    async def inject_cookies(self, cookie_string: str):
+    async def inject_cookies(self, cookie_string: str, persist: bool = True):
         """
         从浏览器 Cookie 字符串直接注入（跳过登录/验证码流程）。
         格式: "key1=val1; key2=val2; ..."
@@ -93,8 +125,8 @@ class BrowserManager:
         if self._heybox_id:
             logger.info("用户 ID: %s", self._heybox_id)
 
-        self._save_cookies(cookies)
-        logger.info("Cookie 已保存到 %s", self.COOKIES_FILE)
+        if persist:
+            self.persist_cookies()
 
     async def start_session(self):
         """启动会话：导航到首页后常驻，后续 API 全走 fetch() 不触发导航"""
@@ -172,6 +204,20 @@ class BrowserManager:
             logger.warning("Cookie 验证失败: %s", e)
             return False
 
+    async def validate_cookies(self) -> bool:
+        """验证当前 Cookie；成功时顺带准备 API 页面。"""
+        is_valid = await self._verify_cookies()
+        if is_valid:
+            await self._ensure_api_page()
+        return is_valid
+
+    def persist_cookies(self):
+        """将当前 Cookie 持久化到本地。"""
+        if not self._cookies:
+            raise ValueError("当前没有可保存的 Cookie")
+        self._save_cookies(self._cookies)
+        logger.info("Cookie 已保存到 %s", self.COOKIES_FILE)
+
     async def _ensure_api_page(self):
         """确保存在用于 API 请求的页面"""
         if self._api_page and not self._api_page.is_closed():
@@ -191,15 +237,69 @@ class BrowserManager:
             self._playwright = await async_playwright().start()
 
         launch_headless = self.headless if headless is None else headless
-        try:
-            self._browser = await self._playwright.chromium.launch(
-                channel="chrome",
-                headless=launch_headless,
+        if not launch_headless and _is_linux() and not _has_display_server():
+            raise RuntimeError(
+                "当前 Linux 环境未检测到 DISPLAY/WAYLAND_DISPLAY，无法打开图形浏览器。"
+                "请改用 `--headless`、导入 Cookie，或在 Xvfb/桌面会话中运行。"
             )
-        except Exception as exc:
-            logger.warning("Chrome 通道启动失败，回退 Playwright Chromium: %s", exc)
-            self._browser = await self._playwright.chromium.launch(
-                headless=launch_headless,
+
+        launch_args = []
+        if _is_linux():
+            launch_args.extend(["--disable-dev-shm-usage", "--disable-gpu"])
+            if _is_root_user() or _env_flag("XHH_BROWSER_NO_SANDBOX"):
+                launch_args.extend(["--no-sandbox", "--disable-setuid-sandbox"])
+
+        extra_args = os.environ.get("XHH_BROWSER_ARGS", "").strip()
+        if extra_args:
+            launch_args.extend(shlex.split(extra_args))
+
+        # Remove duplicates while keeping original order.
+        launch_args = list(dict.fromkeys(launch_args))
+        base_options = {
+            "headless": launch_headless,
+            "args": launch_args,
+        }
+
+        executable_path = os.environ.get("XHH_BROWSER_EXECUTABLE", "").strip()
+        browser_channel = os.environ.get("XHH_BROWSER_CHANNEL", "").strip()
+        candidates: list[tuple[str, dict]] = []
+
+        if executable_path:
+            candidates.append((
+                f"executable:{executable_path}",
+                {**base_options, "executable_path": executable_path},
+            ))
+        elif browser_channel:
+            candidates.append((
+                f"channel:{browser_channel}",
+                {**base_options, "channel": browser_channel},
+            ))
+        elif _is_linux():
+            candidates.extend([
+                ("playwright-chromium", dict(base_options)),
+                ("chrome", {**base_options, "channel": "chrome"}),
+            ])
+        else:
+            candidates.extend([
+                ("chrome", {**base_options, "channel": "chrome"}),
+                ("playwright-chromium", dict(base_options)),
+            ])
+
+        launch_errors = []
+        for candidate_name, candidate_options in candidates:
+            try:
+                logger.info("尝试启动浏览器: %s (headless=%s)", candidate_name, launch_headless)
+                self._browser = await self._playwright.chromium.launch(**candidate_options)
+                break
+            except Exception as exc:
+                launch_errors.append(f"{candidate_name}: {exc}")
+                logger.warning("浏览器启动失败 (%s): %s", candidate_name, exc)
+
+        if not self._browser:
+            raise RuntimeError(
+                "无法启动浏览器。请先执行 `playwright install chromium`，"
+                "或通过 `XHH_BROWSER_EXECUTABLE` 指定浏览器路径。"
+                f" 最近错误: {' | '.join(launch_errors[-2:])}"
             )
 
         self._context = await self._browser.new_context()
@@ -210,6 +310,12 @@ class BrowserManager:
 
     async def open_browser_for_login(self):
         """打开浏览器等待用户手动登录，轮询检测 Cookie"""
+        if self.headless:
+            raise RuntimeError(
+                "当前为无头模式，无法进行手动登录。"
+                "纯命令行 Linux 建议使用密码登录或 `xiaoheihe login --cookie-file <path>`。"
+            )
+
         print("\n" + "=" * 60)
         print("需要登录")
         print("正在打开浏览器，请在浏览器中完成登录...")
@@ -381,12 +487,19 @@ class BrowserManager:
 
     async def login_with_phone(self, phone: str, code_callback=None, password=None) -> bool:
         """手机号登录入口（密码优先）"""
+        if not password and self.headless:
+            raise RuntimeError(
+                "验证码登录需要图形页面，不适合纯命令行无头环境。"
+                "请改用 `--password`，或直接导入 Cookie。"
+            )
         if password:
             return await self.api_login(phone, password)
         return await self.login_with_phone_ui(phone, code_callback)
 
     async def login_with_phone_ui(self, phone: str, code_callback=None, password=None):
         """验证码 UI 登录（备用方案）"""
+        if self.headless:
+            raise RuntimeError("UI 登录需要可见浏览器，请关闭无头模式后再试。")
         mode = "密码" if password else "验证码"
         print(f"\n📱 小黑盒{mode}登录 (UI模式)\n   号码: {phone}\n")
 

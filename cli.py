@@ -58,6 +58,46 @@ def color(text: str, code: str = "") -> str:
     return f"{code}{text}{RESET}"
 
 
+def _env_flag(name: str) -> Optional[bool]:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return None
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _default_headless() -> bool:
+    forced = _env_flag("XHH_HEADLESS")
+    if forced is not None:
+        return forced
+    if sys.platform.startswith("linux"):
+        return not any(os.environ.get(name) for name in ("DISPLAY", "WAYLAND_DISPLAY", "MIR_SOCKET"))
+    return False
+
+
+def _read_cookie_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def _cookie_override_from_args(args) -> Optional[str]:
+    cookie_string = getattr(args, "cookie", None)
+    if cookie_string:
+        return cookie_string.strip()
+
+    cookie_file = getattr(args, "cookie_file", None)
+    if cookie_file:
+        try:
+            return _read_cookie_file(cookie_file)
+        except OSError as exc:
+            raise SystemExit(f"读取 Cookie 文件失败: {exc}") from exc
+
+    return None
+
+
 # ==================== 辅助函数 ====================
 
 
@@ -416,8 +456,9 @@ class _ClientCtx:
 
     def __init__(self, args):
         self.args = args
-        self._cookie_override = bool(getattr(args, "cookie", None))
-        self._cookie = get_cookie(getattr(args, "cookie", None))
+        cookie_override = _cookie_override_from_args(args)
+        self._cookie_override = bool(cookie_override)
+        self._cookie = get_cookie(cookie_override)
         self._use_daemon = _check_daemon() and not self._cookie_override
         self._client: Optional[XiaoheiheClient] = None
 
@@ -571,17 +612,60 @@ async def cmd_login(args):
     """
     from browser_manager import BrowserManager
 
+    cookie_string = getattr(args, "cookie_string", None)
+    cookie_file = getattr(args, "cookie_file", None)
+    import_cookie = None
+    if cookie_string:
+        import_cookie = cookie_string.strip()
+    elif cookie_file:
+        try:
+            import_cookie = _read_cookie_file(cookie_file)
+        except OSError as e:
+            print(color(f"  ❌ 读取 Cookie 文件失败: {e}", RED))
+            return
+
+    if import_cookie:
+        bm = BrowserManager(headless=True)
+        try:
+            await bm.inject_cookies(import_cookie, persist=False)
+            verify_ok = True
+            if not args.skip_verify:
+                verify_ok = await bm.validate_cookies()
+                if not verify_ok and not bm.heybox_id:
+                    print(color("  ❌ Cookie 校验失败，请确认内容仍然有效。", RED))
+                    return
+            bm.persist_cookies()
+        finally:
+            await bm.close()
+
+        print(f"\n{color('  ✅ Cookie 已导入并保存。', GREEN)}")
+        if not args.skip_verify and not verify_ok:
+            print(color("   ⚠ 在线校验未通过，但已保留 Cookie。建议继续执行 list/pub 做一次实测。", YELLOW))
+        print("   后续可直接在纯命令行 Linux 环境执行:")
+        print("   python cli.py list")
+        print("   python cli.py pub '标题' -c '<p>内容</p>'\n")
+
+        result = {
+            "status": "ok",
+            "message": "Cookie 导入成功",
+            "heybox_id": bm.heybox_id,
+            "verified": (None if args.skip_verify else verify_ok),
+        }
+        if args.format == "json":
+            OutputFormatter.json(result, args.output)
+        return
+
     phone = getattr(args, "phone", "")
     if not phone:
-        print(color("  ❌ 请提供手机号: --phone 13800138000", RED))
+        print(color("  ❌ 请提供手机号，或使用 --cookie-file / --cookie-string 导入 Cookie。", RED))
         return
 
     bm = BrowserManager(headless=args.headless)
     try:
-        success = await bm.login_with_phone(
-            phone=phone,
-            password=getattr(args, "password", None),
-        )
+        success = await bm.login_with_phone(phone=phone, password=getattr(args, "password", None))
+    except RuntimeError as e:
+        print(color(f"  ❌ {e}", RED))
+        return
     finally:
         await bm.close()
 
@@ -754,6 +838,7 @@ _HANDLERS = {
 
 
 def main():
+    default_headless = _default_headless()
     parser = argparse.ArgumentParser(
         prog="xiaoheihe",
         description=color(f"小黑盒 CLI {_VERSION} — 社区数据 & 发布工具 (Agent友好)", BOLD),
@@ -774,18 +859,21 @@ def main():
 
 服务器部署:
   export XHH_COOKIE="你的cookie字符串"
+  %(prog)s login --cookie-file /path/to/cookie.txt
   %(prog)s -f json get 179245676           Agent 友好的 JSON 输出
         """,
     )
-    parser.add_argument("--headless", action="store_true",
-                        help="无头模式（默认关闭，交互命令自动弹出浏览器）")
+    parser.add_argument("--headless", action="store_true", default=default_headless,
+                        help=f"无头模式（默认: {'开启' if default_headless else '关闭'}）")
     parser.add_argument("--no-headless", dest="headless", action="store_false",
-                        help="关闭无头模式（同默认行为）")
+                        help="关闭无头模式")
     parser.add_argument("-f", "--format", choices=["json", "table", "csv"],
                         default="json", help="输出格式（默认json）")
     parser.add_argument("-o", "--output", default=None, help="输出文件路径")
     parser.add_argument("--cookie", default=None,
                         help="Cookie 字符串（优先级最高，覆盖环境变量和配置文件）")
+    parser.add_argument("--cookie-file", default=None,
+                        help="从文件读取 Cookie 字符串（适合 Linux 服务器）")
 
     subparsers = parser.add_subparsers(dest="command", help="命令")
 
@@ -834,10 +922,23 @@ def main():
 
     # --- login ---
     p_login = subparsers.add_parser("login", aliases=["li"], help="手机号登录（密码或验证码）")
-    p_login.add_argument("--phone", required=True,
+    p_login.add_argument("--headless", action="store_true", default=default_headless,
+                         help=f"无头模式（默认: {'开启' if default_headless else '关闭'}）")
+    p_login.add_argument("--no-headless", dest="headless", action="store_false",
+                         help="关闭无头模式")
+    p_login.add_argument("-f", "--format", choices=["json", "table", "csv"],
+                         default="json", help="输出格式（默认json）")
+    p_login.add_argument("-o", "--output", default=None, help="输出文件路径")
+    p_login.add_argument("--phone", required=False,
                          help="手机号，如 13800138000")
     p_login.add_argument("--password", default=None,
                          help="登录密码（提供则使用密码模式，不提供则用验证码模式）")
+    p_login.add_argument("--cookie-string", default=None,
+                         help="直接导入 Cookie 字符串并保存")
+    p_login.add_argument("--cookie-file", default=None,
+                         help="从文件导入 Cookie 字符串并保存")
+    p_login.add_argument("--skip-verify", action="store_true",
+                         help="导入 Cookie 时跳过在线校验")
 
     # --- publish ---
     p_pub = subparsers.add_parser("publish", aliases=["pub"], help="发布/保存草稿")
@@ -863,7 +964,8 @@ def main():
         sys.exit(1)
 
     # Cookie 提示（login 命令不需要 cookie）
-    cookie = get_cookie(getattr(args, "cookie", None))
+    cookie_override = _cookie_override_from_args(args)
+    cookie = get_cookie(cookie_override)
     if not cookie and cmd not in ("serve", "status", "login"):
         logger.debug("未提供 Cookie，将尝试守护模式或交互登录")
 
