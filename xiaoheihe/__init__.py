@@ -82,6 +82,26 @@ class XiaoheiheClient:
         self._api_client.set_heybox_id(self._browser_manager.heybox_id)
         logger.info("Cookie 注入模式就绪 (heybox_id=%s)", self._browser_manager.heybox_id)
 
+    async def login(self, phone: str, code_callback=None) -> bool:
+        """
+        手机号 + 验证码登录。
+        登录成功后自动保存 Cookie，后续可直接使用。
+
+        Args:
+            phone: 完整手机号（含区号），如 "+8613800138000"
+            code_callback: 异步回调返回验证码（None 则用 input 等待）
+
+        Returns:
+            True=登录成功, False=失败
+        """
+        self._browser_manager = BrowserManager(headless=self.headless)
+        success = await self._browser_manager.login_with_phone(phone, code_callback)
+        if success:
+            await self._browser_manager.start_session()
+            self._api_client = XiaoheiheAPIClient(page=self._browser_manager.api_page)
+            self._api_client.set_heybox_id(self._browser_manager.heybox_id)
+        return success
+
     async def _connect_direct(self):
         """直连：初始化浏览器 + 单页会话"""
         self._browser_manager = BrowserManager(headless=self.headless)

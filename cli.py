@@ -537,6 +537,53 @@ async def cmd_publish(args):
         OutputFormatter.json(result, args.output)
 
 
+async def cmd_login(args):
+    """
+    手机号验证码登录。
+    登录成功后 Cookie 自动保存，后续命令无需再登录。
+    支持服务器 headless 模式（通过 stdin 输入验证码）。
+    """
+    from browser_manager import BrowserManager
+
+    phone = getattr(args, "phone", "")
+    if not phone:
+        print(color("  ❌ 请提供手机号: --phone +8613800138000", RED))
+        return
+
+    bm = BrowserManager(headless=args.headless)
+    try:
+        success = await bm.login_with_phone(phone)
+    finally:
+        await bm.close()
+
+    if success:
+        print(f"\n{color('  ✅ 登录完成！Cookie 已保存。', GREEN)}")
+        print(f"   后续所有命令可直接使用:")
+        print(f"   python cli.py get <id>")
+        print(f"   python cli.py pub '标题' -c '<p>内容</p>'\n")
+
+        # 输出 JSON 结果
+        result = {
+            "status": "ok",
+            "message": "登录成功",
+            "heybox_id": bm.heybox_id,
+            "headless": args.headless,
+            "phone": phone[:len(phone) - 4] + "****",
+        }
+        if args.format == "json":
+            OutputFormatter.json(result, args.output)
+    else:
+        print(f"\n{color('  ❌ 登录失败', RED)}")
+        print("   可尝试: python cli.py login --phone <号码> (不带 --headless 弹出浏览器)")
+        result = {
+            "status": "error",
+            "message": "登录失败",
+            "phone": phone[:len(phone) - 4] + "****",
+        }
+        if args.format == "json":
+            OutputFormatter.json(result, args.output)
+
+
 async def cmd_serve(args):
     print()
     print(color("  小黑盒守护进程", BOLD))
@@ -658,6 +705,7 @@ _CMD_ALIASES = {
     "cr": "creator",
     "ls": "list",
     "pub": "publish",
+    "li": "login",
 }
 
 _HANDLERS = {
@@ -669,6 +717,7 @@ _HANDLERS = {
     "publish": cmd_publish,
     "serve": cmd_serve,
     "status": cmd_status,
+    "login": cmd_login,
 }
 
 
@@ -740,6 +789,11 @@ def main():
     # --- list ---
     subparsers.add_parser("list", aliases=["ls"], help="查看已发布文章列表")
 
+    # --- login ---
+    p_login = subparsers.add_parser("login", aliases=["li"], help="手机号验证码登录")
+    p_login.add_argument("--phone", required=True,
+                         help="手机号（含区号），如 +8613800138000 或 +49123456789")
+
     # --- publish ---
     p_pub = subparsers.add_parser("publish", aliases=["pub"], help="发布/保存草稿")
     p_pub.add_argument("title", help="文章标题（用引号包裹）")
@@ -763,9 +817,9 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    # Cookie 提示
+    # Cookie 提示（login 命令不需要 cookie）
     cookie = get_cookie(getattr(args, "cookie", None))
-    if not cookie and cmd != "serve" and cmd != "status":
+    if not cookie and cmd not in ("serve", "status", "login"):
         logger.debug("未提供 Cookie，将尝试守护模式或交互登录")
 
     if cmd == "serve":
