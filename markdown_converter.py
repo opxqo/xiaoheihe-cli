@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import base64
+import html as html_lib
 import io
 import re
 from dataclasses import dataclass, field
@@ -36,11 +37,12 @@ from typing import List, Optional
 # 延迟导入，避免无 GUI 环境报错
 _PIL_AVAILABLE = False
 _PYGMENTS_AVAILABLE = False
+_MARKDOWN_AVAILABLE = False
 
 
 def _check_deps():
     """检查并标记可用依赖。"""
-    global _PIL_AVAILABLE, _PYGMENTS_AVAILABLE
+    global _PIL_AVAILABLE, _PYGMENTS_AVAILABLE, _MARKDOWN_AVAILABLE
     try:
         from PIL import Image, ImageDraw, ImageFont  # noqa: F401
         _PIL_AVAILABLE = True
@@ -51,6 +53,11 @@ def _check_deps():
         from pygments.lexers import get_lexer_by_name  # noqa: F401
         from pygments.formatters import ImageFormatter  # noqa: F401
         _PYGMENTS_AVAILABLE = True
+    except ImportError:
+        pass
+    try:
+        import markdown  # noqa: F401
+        _MARKDOWN_AVAILABLE = True
     except ImportError:
         pass
 
@@ -159,6 +166,28 @@ class HeyBoxConverter:
             return "html"
         return "markdown"
 
+    @staticmethod
+    def _render_markdown_html(md_text: str) -> str:
+        """
+        将 Markdown 转成基础 HTML。
+        优先使用 python-markdown，与参考编辑器的“先解析 Markdown 再导出 HTML”思路保持一致。
+        """
+        if _MARKDOWN_AVAILABLE:
+            import markdown
+
+            return markdown.markdown(
+                md_text,
+                extensions=[
+                    "extra",
+                    "sane_lists",
+                    "nl2br",
+                ],
+                output_format="xhtml",
+            )
+
+        # 兜底：保留旧行为，至少能输出基础段落结构
+        return HeyBoxConverter._wrap_paragraphs(md_text)
+
     # ==================== Markdown 转换主流程 ====================
 
     def _convert_markdown(self, md: str) -> str:
@@ -177,10 +206,11 @@ class HeyBoxConverter:
         # Phase 4: 格式标准化（行内代码、删除线、链接等）
         result = self._normalize_markdown_format(result)
 
-        # Phase 5: 段落包装
-        result = self._wrap_paragraphs(result)
+        # Phase 5: Markdown → HTML
+        html = self._render_markdown_html(result)
 
-        return result.strip()
+        # Phase 6: 再走 HTML 兼容化，输出更接近编辑器复制出的结构
+        return self._convert_html(html)
 
     # ==================== HTML 转换主流程 ====================
 
@@ -203,6 +233,9 @@ class HeyBoxConverter:
         # Phase 5: 链接标准化
         result = self._normalize_links(result)
 
+        # Phase 6: 输出结构收敛为更保守的 HTML 子集
+        result = self._normalize_html_structure(result)
+
         return result.strip()
 
     # ================================================================
@@ -223,7 +256,8 @@ class HeyBoxConverter:
                 return ""
 
             img_html = self._render_code_image(code_content, lang)
-            self.stats.code_blocks += 1
+            if "<img " in img_html:
+                self.stats.code_blocks += 1
             return img_html
 
         # 匹配 fenced code block: ```lang\n...\n```
@@ -256,7 +290,8 @@ class HeyBoxConverter:
                 return match.group(0)  # 保持原样
 
             img_html = self._render_code_image(code_content, lang)
-            self.stats.code_blocks += 1
+            if "<img " in img_html:
+                self.stats.code_blocks += 1
             return img_html
 
         return re.sub(
@@ -375,16 +410,15 @@ class HeyBoxConverter:
 
         def replace(m):
             content = m.group(1)
-            # 跳过已经在 pre/code 块内的（已由 _process_html_code_blocks 处理）
-            if "</pre>" in html[: m.start()]:
-                last_pre_close = html.rfind("</pre>", 0, m.start())
-                last_pre_open = html.rfind("<pre", 0, m.start())
-                if last_pre_open > last_pre_close:
-                    return m.group(0)  # 在 pre 块内，跳过
+            # 跳过已经在 pre 块内的（已由 _process_html_code_blocks 处理）
+            last_pre_open = html.rfind("<pre", 0, m.start())
+            last_pre_close = html.rfind("</pre>", 0, m.start())
+            if last_pre_open != -1 and last_pre_open > last_pre_close:
+                return m.group(0)
             self.stats.inline_codes += 1
             return f"<strong>{content}</strong>"
 
-        return re.sub(r"<code>([\s\S]*?)</code>", replace, html)
+        return re.sub(r"<code\b[^>]*>([\s\S]*?)</code>", replace, html, flags=re.IGNORECASE)
 
     def _process_html_strikethrough(self, html: str) -> str:
         """HTML <del>/<s> → <strong>。"""
@@ -399,26 +433,46 @@ class HeyBoxConverter:
         )
         return html
 
-    @staticmethod
-    def _normalize_links(text: str) -> str:
+    def _normalize_links(self, text: str) -> str:
         """链接标准化：保留小黑盒内部链接，外部链接展开。"""
 
-        def process_link(m):
+        def process_markdown_link(m):
             link_text = m.group(1)
-            url = m.group(2)
+            url = m.group(2).strip()
 
-            # 保留小黑盒内部链接原格式
             if re.match(
                 r"https?://www\.xiaoheihe\.cn/app/bbs/link/", url, re.IGNORECASE
             ):
                 return m.group(0)
 
-            # 外部链接：展开显示
-            clean_url = url.split("?")[0]  # 去掉查询参数
+            self.stats.links_fixed += 1
+            clean_url = url.split("?")[0]
             return f"**{link_text}**（{clean_url}）"
 
-        # Markdown 格式 [text](url)
-        result = re.sub(r"\[([^\]]*)\]\(([^)]+)\)", process_link, text)
+        def process_html_link(m):
+            url = html_lib.unescape(m.group(3).strip())
+            inner = m.group(4)
+
+            if re.match(
+                r"https?://www\.xiaoheihe\.cn/app/bbs/link/", url, re.IGNORECASE
+            ):
+                safe_href = html_lib.escape(url, quote=True)
+                return f'<a href="{safe_href}">{inner}</a>'
+
+            self.stats.links_fixed += 1
+            clean_url = url.split("?")[0]
+            link_text = re.sub(r"<[^>]+>", "", inner).strip() or clean_url
+            safe_text = html_lib.escape(link_text)
+            safe_url = html_lib.escape(clean_url)
+            return f"<strong>{safe_text}</strong>（{safe_url}）"
+
+        result = re.sub(r"\[([^\]]*)\]\(([^)]+)\)", process_markdown_link, text)
+        result = re.sub(
+            r"<a\b([^>]*?)href=(['\"])(.*?)\2[^>]*>([\s\S]*?)</a>",
+            process_html_link,
+            result,
+            flags=re.IGNORECASE,
+        )
 
         return result
 
@@ -465,6 +519,72 @@ class HeyBoxConverter:
 
         return "\n".join(result)
 
+    @staticmethod
+    def _normalize_html_structure(html: str) -> str:
+        """将 HTML 收敛到更适合小黑盒的保守标签集合。"""
+        result = html or ""
+        result = re.sub(r"<!--[\s\S]*?-->", "", result)
+
+        # 常见块容器压成段落，尽量贴近编辑器复制出的结构
+        result = re.sub(r"<div\b[^>]*>", "<p>", result, flags=re.IGNORECASE)
+        result = re.sub(r"</div>", "</p>", result, flags=re.IGNORECASE)
+        result = re.sub(r"</?(?:span|font)\b[^>]*>", "", result, flags=re.IGNORECASE)
+
+        # 标准化换行与分隔
+        result = re.sub(r"<br\s*/?>", "<br />", result, flags=re.IGNORECASE)
+        result = re.sub(r"<hr\b[^>]*>", "<hr />", result, flags=re.IGNORECASE)
+
+        # 图片只保留 src / alt
+        result = re.sub(
+            r"<img\b[^>]*>",
+            HeyBoxConverter._sanitize_img_tag,
+            result,
+            flags=re.IGNORECASE,
+        )
+
+        # 内部链接只保留 href
+        result = re.sub(
+            r"<a\b[^>]*href=(['\"])(.*?)\1[^>]*>",
+            HeyBoxConverter._sanitize_anchor_open_tag,
+            result,
+            flags=re.IGNORECASE,
+        )
+
+        # 常见标签去掉 style/class 等属性
+        simple_tags = (
+            "p", "h1", "h2", "h3", "h4", "h5", "h6",
+            "ul", "ol", "li", "blockquote",
+            "strong", "em", "code", "pre",
+            "table", "thead", "tbody", "tr", "td", "th",
+        )
+        result = re.sub(
+            rf"<({'|'.join(simple_tags)})\b[^>]*>",
+            lambda m: f"<{m.group(1).lower()}>",
+            result,
+            flags=re.IGNORECASE,
+        )
+
+        result = re.sub(r"<p>\s*</p>", "", result, flags=re.IGNORECASE)
+        result = re.sub(r"\n{3,}", "\n\n", result)
+        return result.strip()
+
+    @staticmethod
+    def _sanitize_img_tag(match) -> str:
+        tag = match.group(0)
+        src_match = re.search(r"\bsrc=(['\"])(.*?)\1", tag, flags=re.IGNORECASE)
+        if not src_match:
+            return ""
+
+        alt_match = re.search(r"\balt=(['\"])(.*?)\1", tag, flags=re.IGNORECASE)
+        src = html_lib.escape(html_lib.unescape(src_match.group(2)), quote=True)
+        alt = html_lib.escape(html_lib.unescape(alt_match.group(2)), quote=True) if alt_match else ""
+        return f'<img src="{src}" alt="{alt}" />'
+
+    @staticmethod
+    def _sanitize_anchor_open_tag(match) -> str:
+        href = html_lib.escape(html_lib.unescape(match.group(2)), quote=True)
+        return f'<a href="{href}">'
+
     # ================================================================
     #  图片渲染引擎（需要 Pillow + Pygments）
     # ================================================================
@@ -475,19 +595,12 @@ class HeyBoxConverter:
         如果依赖不可用则回退到 <pre> 文本块。
         """
         if not (_PIL_AVAILABLE and _PYGMENTS_AVAILABLE):
-            # 回退：返回带样式的 pre 标签
-            escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            return (
-                f'<div style="background:{self.COLOR_CODE_BG};'
-                f"border-radius:8px;padding:16px;"
-                f'font-family:monospace;font-size:14px;'
-                f'overflow-x:auto;white-space:pre;">{escaped}</div>'
-            )
+            escaped = html_lib.escape(code)
+            return f"<pre><code>{escaped}</code></pre>"
 
         import pygments
         from pygments.formatters import ImageFormatter
         from pygments.lexers import get_lexer_by_name, guess_lexer
-        from PIL import Image as PILImage
 
         try:
             # 选择词法分析器
@@ -501,12 +614,11 @@ class HeyBoxConverter:
 
             # 配置图片格式化器
             formatter = ImageFormatter(
-                style="github",
+                style="friendly",
                 linenos=False,
                 font_size=14,
                 line_padding=4,
                 image_pad=16,
-                border_radius=8,
                 background_color=self.COLOR_CODE_BG,
             )
 
@@ -515,22 +627,11 @@ class HeyBoxConverter:
 
             # 转 Base64
             b64 = base64.b64encode(png_data).decode("ascii")
-            lang_label = lang or "code"
-
-            return (
-                f'<img src="data:image/png;base64,{b64}" '
-                f'alt="代码块 ({lang_label})" '
-                f'style="max-width:100%;border-radius:8px;" />'
-            )
+            return f'<img src="data:image/png;base64,{b64}" alt="代码块" />'
 
         except Exception:
-            # 渲染失败时回退
-            escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            return (
-                f'<div style="background:{self.COLOR_CODE_BG};'
-                f"border-radius:8px;padding:16px;"
-                f'font-family:monospace;font-size:14px;">{escaped}</div>'
-            )
+            escaped = html_lib.escape(code)
+            return f"<pre><code>{escaped}</code></pre>"
 
     def _render_table_image(self, table_md: str) -> Optional[str]:
         """
@@ -701,10 +802,7 @@ class HeyBoxConverter:
             img.save(buf, format="PNG")
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
-            return (
-                f'<img src="data:image/png;base64,{b64}" '
-                f'alt="表格" style="max-width:100%;" />'
-            )
+            return f'<img src="data:image/png;base64,{b64}" alt="表格" />'
 
         except Exception as e:
             logger_error = __import__("logging").getLogger(__name__).error
